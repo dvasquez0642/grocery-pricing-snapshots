@@ -1,0 +1,1361 @@
+---
+title: "Karen's Basket Inflation Index"
+subtitle: "2020-2025 grocery price inflation from a 394-product Wayback Machine basket"
+author: "Grocery Pricing Project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+root_dir <- getwd()
+if (!file.exists(file.path(root_dir, "scripts", "run-r.sh"))) {
+  candidate_root <- normalizePath(file.path(root_dir, ".."), winslash = "/", mustWork = FALSE)
+  if (file.exists(file.path(candidate_root, "scripts", "run-r.sh"))) {
+    root_dir <- candidate_root
+  } else {
+    stop("Run this document from the repo root or from analysis/.", call. = FALSE)
+  }
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(readr)
+  library(scales)
+  library(knitr)
+  library(stringr)
+  library(purrr)
+})
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 5.5,
+  out.width = "100%"
+)
+
+theme_set(
+  theme_minimal(base_size = 13) +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title.position = "plot",
+      plot.caption.position = "plot",
+      legend.position = "bottom"
+    )
+)
+
+palette_year <- c(
+  "2020" = "#0f172a",
+  "2021" = "#1d4ed8",
+  "2022" = "#0891b2",
+  "2023" = "#16a34a",
+  "2024" = "#ea580c",
+  "2025" = "#dc2626"
+)
+
+palette_chain <- c(
+  "Hannaford Supermarket & Pharmacy" = "#0f766e",
+  "Gordon Food Service Store Mp183" = "#7c3aed",
+  "Other chains" = "#94a3b8"
+)
+
+# ----- Load enriched if present, otherwise raw -------------------------------
+
+enriched_path <- file.path(root_dir, "analysis", "karens_basket_enriched.csv")
+raw_path <- file.path(root_dir, "20260429_karens_basket_coverage.csv")
+
+if (file.exists(enriched_path)) {
+  raw <- read_csv(enriched_path, show_col_types = FALSE)
+  enriched_available <- TRUE
+} else {
+  raw <- read_csv(raw_path, show_col_types = FALSE)
+  enriched_available <- FALSE
+  raw$package_size_raw <- NA_character_
+  raw$package_qty <- NA_real_
+  raw$package_qty_unit <- NA_character_
+  raw$unit_price <- NA_real_
+  raw$enrichment_status <- "not_run"
+}
+
+# Parse timestamp
+raw <- raw %>%
+  mutate(
+    ts = as.POSIXct(timestamp, tz = "UTC"),
+    month = format(ts, "%Y-%m"),
+    year = as.integer(year)
+  )
+
+n_rows_raw <- nrow(raw)
+n_chains_raw <- length(unique(raw$chain))
+n_products_raw <- length(unique(raw$product_name))
+```
+
+```{r css, results='asis'}
+cat(
+  "<style>
+  .metric-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin: 18px 0 26px 0; }
+  .metric-card { background: #f8fafc; border-left: 4px solid #0f766e; padding: 12px 16px; border-radius: 6px; }
+  .metric-label { color: #475569; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .metric-value { font-size: 24px; font-weight: 700; color: #0f172a; margin-top: 4px; }
+  .metric-note { font-size: 12px; color: #64748b; margin-top: 4px; }
+  table.cleaning-table th { background: #f1f5f9; }
+  </style>"
+)
+```
+
+# Headline
+
+This report computes an inflation index for "Karen's basket" — 394 grocery products extracted from Wayback Machine snapshots of 15 chains, 2020-2025, restricted to non-sale prices. The basket is dominated by **Hannaford Supermarket & Pharmacy** (`r format(sum(raw$chain == "Hannaford Supermarket & Pharmacy"), big.mark=",")` rows) and **Gordon Food Service** (`r format(sum(raw$chain == "Gordon Food Service Store Mp183"), big.mark=",")` rows), which together account for **`r round(100 * sum(raw$chain %in% c("Hannaford Supermarket & Pharmacy", "Gordon Food Service Store Mp183")) / n_rows_raw, 1)`%** of all rows.
+
+The headline inflation estimates use **Laspeyres**, **Paasche**, and **Fisher** indices on a cleaned basket with **equal product weights**, presented alongside three weighting-scheme and four robustness sensitivities. Because the raw input has substantial data-quality issues (encoding-duplicated names, package-size variants, scraper-garbage entries, mixed units, single-row decimal-point errors), the analysis applies an explicit cleaning pipeline before computing inflation; the full breakdown follows in the sections below.
+
+```{r preflight, include=FALSE}
+# Run the full pipeline silently so the headline metric grid below has its inputs.
+# Detail chunks further down will re-display these computations with their own narrative.
+
+# --- Cleaning ---
+df <- raw %>% distinct(timestamp, chain, location, product_name, price, unit, .keep_all = TRUE)
+
+collapse_name_pf <- function(s) {
+  s <- gsub("\\\\u[0-9a-fA-F]{4}", "?", s)
+  s <- iconv(s, from = "", to = "ASCII", sub = "?")
+  s <- tolower(trimws(gsub("\\s+", " ", s)))
+  s
+}
+canon_map_pf <- raw %>%
+  mutate(canon_key = collapse_name_pf(product_name)) %>%
+  group_by(canon_key) %>%
+  summarise(canonical = product_name[which.min(grepl("\\\\u00", product_name) + grepl("[^\x01-\x7f]", product_name))],
+            .groups = "drop")
+df <- df %>%
+  mutate(canon_key = collapse_name_pf(product_name)) %>%
+  left_join(canon_map_pf, by = "canon_key") %>%
+  mutate(product_name = ifelse(is.na(canonical), product_name, canonical)) %>%
+  select(-canon_key, -canonical)
+
+garbage_re_pf <- "( USD| Select Number of Trays|Serves:|All Varieties -)"
+df <- df %>% filter(!grepl(garbage_re_pf, product_name))
+
+df <- df %>%
+  mutate(
+    eff_qty = ifelse(!is.na(package_qty) & package_qty > 0, package_qty, NA_real_),
+    eff_unit = ifelse(!is.na(package_qty_unit) & package_qty_unit != "", package_qty_unit,
+                      ifelse(is.na(unit), "unknown", unit)),
+    eff_unit_price = ifelse(!is.na(unit_price) & unit_price > 0, unit_price, price)
+  )
+
+case_lb_products_pf <- df %>%
+  filter(eff_unit %in% c("case","lb")) %>%
+  group_by(product_name) %>%
+  summarise(units = list(unique(eff_unit)), .groups = "drop") %>%
+  filter(map_lgl(units, ~ all(c("case","lb") %in% .x)))
+for (p in case_lb_products_pf$product_name) {
+  med_lb <- df %>% filter(product_name == p, eff_unit == "lb") %>% pull(price) %>% median()
+  if (is.na(med_lb) || med_lb <= 0) next
+  bad_idx <- which(df$product_name == p & df$eff_unit == "case" & df$price < 2 * med_lb)
+  if (length(bad_idx) > 0) df$eff_unit[bad_idx] <- "lb"
+}
+
+unenriched_multi_pf <- df %>%
+  group_by(timestamp, chain, location, product_name) %>%
+  summarise(n_distinct_price = n_distinct(price),
+            any_enriched = any(enrichment_status == "ok"), .groups = "drop") %>%
+  filter(n_distinct_price > 1, !any_enriched)
+df_clean_pf <- df %>%
+  anti_join(unenriched_multi_pf %>% select(timestamp, chain, location, product_name),
+            by = c("timestamp","chain","location","product_name")) %>%
+  mutate(item_key = paste(product_name, eff_unit,
+                          ifelse(is.na(eff_qty), "NA", as.character(eff_qty)), sep = " | "))
+
+# Outlier removal
+df_clean_pf <- df_clean_pf %>%
+  group_by(item_key, year) %>%
+  mutate(other_median = sapply(seq_len(n()), function(i) {
+    o <- price[-i]; if (length(o) == 0) NA_real_ else median(o, na.rm = TRUE)
+  })) %>%
+  ungroup() %>%
+  filter(is.na(other_median) | other_median <= 0 | price <= 5 * other_median) %>%
+  select(-other_median)
+
+key_cov_pf <- df_clean_pf %>% group_by(item_key) %>% summarise(yrs = n_distinct(year), .groups = "drop")
+covered_pf <- key_cov_pf %>% filter(yrs == 6) %>% pull(item_key)
+df_basket_pf <- df_clean_pf %>% filter(item_key %in% covered_pf)
+
+# Annual aggregation -- carry product_name forward for downstream filters
+item_annual_pf <- df_basket_pf %>%
+  group_by(item_key, product_name, year, month) %>%
+  summarise(mm = median(eff_unit_price, na.rm = TRUE), .groups = "drop") %>%
+  group_by(item_key, product_name, year) %>%
+  summarise(ap = mean(mm, na.rm = TRUE), .groups = "drop")
+item_wide_pf <- item_annual_pf %>%
+  pivot_wider(names_from = year, values_from = ap, names_prefix = "p") %>%
+  filter(!is.na(p2020), p2020 > 0)
+for (yr in 2020:2025) {
+  item_wide_pf[[paste0("r", yr)]] <- item_wide_pf[[paste0("p", yr)]] / item_wide_pf[["p2020"]]
+}
+hl_n_items <- nrow(item_wide_pf)
+
+# Equal-weight Fisher (= mean of relatives under fixed weights)
+hl_fisher <- sapply(2020:2025, function(y) mean(item_wide_pf[[paste0("r", y)]], na.rm = TRUE))
+hl_cumulative_2025 <- hl_fisher[6] - 1
+
+# Bootstrap CI
+set.seed(20260429)
+.boot_n <- 500
+.rels_mat <- as.matrix(item_wide_pf[, paste0("r", 2020:2025)])
+.boot_out <- matrix(NA_real_, nrow = .boot_n, ncol = 6)
+for (b in seq_len(.boot_n)) {
+  .idx <- sample.int(nrow(.rels_mat), nrow(.rels_mat), replace = TRUE)
+  .boot_out[b, ] <- colMeans(.rels_mat[.idx, , drop = FALSE], na.rm = TRUE)
+}
+hl_ci_lo <- apply(.boot_out, 2, function(x) quantile(x, 0.05))
+hl_ci_hi <- apply(.boot_out, 2, function(x) quantile(x, 0.95))
+
+# Compute weighting-scheme final-year values for the metric grid
+.cat_lookup <- df_basket_pf %>% distinct(item_key, category)
+.iwc <- item_wide_pf %>% left_join(.cat_lookup, by = "item_key")
+.cat_sizes <- .iwc %>% count(category, name = "n_items")
+
+.w_B <- 1 / nrow(.cat_sizes) / .cat_sizes$n_items[match(.iwc$category, .cat_sizes$category)]
+
+# NHANES weights
+.nhanes_path <- file.path(root_dir, "analysis", "nhanes", "category_group_lookup.csv")
+.top_arch_path <- file.path(root_dir, "analysis", "nhanes", "top_archetypes.csv")
+.have_nhanes <- file.exists(.nhanes_path) && file.exists(.top_arch_path)
+if (.have_nhanes) {
+  .top_arch <- read_csv(.top_arch_path, show_col_types = FALSE)
+  .cat_to_nhanes <- tibble(
+    category = c("Beverages","Bread & Bakery","Dairy & Eggs","Frozen Foods","Household",
+                 "Meat & Poultry","Pantry & Canned","Produce","Seafood","Snacks"),
+    nhanes_groups = list(
+      c("sweet_drink","coffee_tea","juice_smoothie","water","alcohol"),
+      c("bread"),
+      c("milk_dairy_drink","cheese","yogurt","eggs","condiment_fat"),
+      c("mixed_main"), character(0),
+      c("meat_poultry","breakfast_meat","seafood"),
+      c("grain_starch","cereal_oatmeal","beans_nuts","soup","condiment_fat"),
+      c("fruit","vegetables"), c("seafood"),
+      c("salty_snack","sweet_baked")
+    )
+  )
+  .nhanes_share <- .top_arch %>%
+    filter(stratum == "all") %>%
+    mutate(top_groups_split = strsplit(top_groups, ",\\s*")) %>%
+    select(weighted_meals, top_groups_split) %>%
+    tidyr::unnest(top_groups_split) %>%
+    rename(broad_group = top_groups_split) %>%
+    group_by(broad_group) %>%
+    summarise(score = sum(weighted_meals, na.rm = TRUE), .groups = "drop")
+  .cat_score <- .cat_to_nhanes %>%
+    rowwise() %>%
+    mutate(score = sum(.nhanes_share$score[.nhanes_share$broad_group %in% nhanes_groups],
+                       na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(score = ifelse(score == 0, mean(score[score > 0], na.rm = TRUE), score)) %>%
+    mutate(weight = score / sum(score))
+  .w_C_cat <- .cat_score$weight[match(.iwc$category, .cat_score$category)]
+  .w_C <- .w_C_cat / .cat_sizes$n_items[match(.iwc$category, .cat_sizes$category)]
+} else {
+  .w_C <- rep(1 / nrow(.iwc), nrow(.iwc))
+}
+
+.obs_count <- df_basket_pf %>% count(item_key, name = "n_obs")
+.w_D <- .obs_count$n_obs[match(.iwc$item_key, .obs_count$item_key)]
+.w_D <- .w_D / sum(.w_D, na.rm = TRUE)
+
+.weighted_idx_2025 <- function(weights) {
+  r <- .iwc[["r2025"]]
+  k <- !is.na(r) & is.finite(r) & r > 0
+  sum(weights[k] / sum(weights[k]) * r[k])
+}
+hl_scheme_A <- mean(item_wide_pf[["r2025"]], na.rm = TRUE)
+hl_scheme_B <- .weighted_idx_2025(.w_B)
+hl_scheme_C <- .weighted_idx_2025(.w_C)
+hl_scheme_D <- .weighted_idx_2025(.w_D)
+hl_schemes <- c(hl_scheme_A, hl_scheme_B, hl_scheme_C, hl_scheme_D)
+
+# Robustness scenarios for the metric grid (same logic as section 9)
+.obs2020 <- df_basket_pf %>% filter(year == 2020) %>% count(item_key, name = "n_2020")
+.keys_B <- .obs2020 %>% filter(n_2020 >= 3) %>% pull(item_key)
+.iw_B <- item_wide_pf %>% filter(item_key %in% .keys_B)
+
+.var_per_item <- apply(as.matrix(item_wide_pf[, paste0("p", 2020:2025)]), 1, function(x) {
+  x <- x[!is.na(x)]; if (length(x) < 2) 0 else diff(range(x))
+})
+.iw_C <- item_wide_pf %>% filter(.var_per_item > 0)
+
+.suspect_keys <- df %>%
+  group_by(timestamp, chain, location, product_name) %>%
+  summarise(n_pr = n_distinct(price), .groups = "drop") %>%
+  filter(n_pr > 1) %>%
+  distinct(product_name) %>% pull(product_name)
+.iw_D <- item_wide_pf %>% filter(!product_name %in% .suspect_keys)
+
+hl_robust <- c(
+  A = mean(item_wide_pf[["r2025"]], na.rm = TRUE),
+  B = mean(.iw_B[["r2025"]], na.rm = TRUE),
+  C = mean(.iw_C[["r2025"]], na.rm = TRUE),
+  D = mean(.iw_D[["r2025"]], na.rm = TRUE)
+)
+
+# BLS reference
+hl_bls_2025 <- 367.985 / 280.804  # CUUR0000SAF11 2025 / 2020 annual averages
+```
+
+```{r headline-cards, results='asis'}
+card <- function(label, value, note) {
+  paste0(
+    '<div class="metric-card">',
+    '<div class="metric-label">', label, '</div>',
+    '<div class="metric-value">', value, '</div>',
+    '<div class="metric-note">', note, '</div>',
+    '</div>'
+  )
+}
+cards <- c(
+  card("Headline (equal weights)",
+       scales::percent(hl_cumulative_2025, accuracy = 0.1),
+       "cumulative 2020-2025 inflation"),
+  card("Bootstrap 95% CI",
+       sprintf("%s &ndash; %s",
+               scales::percent(hl_ci_lo[6] - 1, accuracy = 0.1),
+               scales::percent(hl_ci_hi[6] - 1, accuracy = 0.1)),
+       "5/95 percentiles, 500 resamples"),
+  card("BLS Food-at-Home (reference)",
+       scales::percent(hl_bls_2025 - 1, accuracy = 0.1),
+       "BLS CPI-U FAH 2020-2025 (CUUR0000SAF11)"),
+  card("Robustness range (A-D)",
+       sprintf("%s &mdash; %s",
+               scales::percent(min(hl_robust) - 1, accuracy = 0.1),
+               scales::percent(max(hl_robust) - 1, accuracy = 0.1)),
+       "min &ndash; max across robustness scenarios"),
+  card("Weighting range (A-D)",
+       sprintf("%s &mdash; %s",
+               scales::percent(min(hl_schemes) - 1, accuracy = 0.1),
+               scales::percent(max(hl_schemes) - 1, accuracy = 0.1)),
+       "min &ndash; max across weighting schemes"),
+  card("Items in headline basket",
+       format(hl_n_items, big.mark = ","),
+       "(product, unit, qty) keys present in all 6 years")
+)
+cat('<div class="metric-grid">')
+cat(paste(cards, collapse = ""))
+cat('</div>')
+```
+
+# Basket overview
+
+```{r overview-summary}
+overview <- tibble(
+  metric = c(
+    "Rows", "Distinct products", "Distinct chains",
+    "Years covered", "Categories", "Wayback URLs"
+  ),
+  value = c(
+    format(n_rows_raw, big.mark = ","),
+    format(n_products_raw, big.mark = ","),
+    format(n_chains_raw, big.mark = ","),
+    paste(min(raw$year), "-", max(raw$year)),
+    format(length(unique(raw$category)), big.mark = ","),
+    format(length(unique(raw$wayback_url)), big.mark = ",")
+  )
+)
+kable(overview, caption = "Raw input dataset")
+```
+
+```{r chain-breakdown}
+chain_tbl <- raw %>%
+  count(chain, name = "rows") %>%
+  arrange(desc(rows)) %>%
+  mutate(share = sprintf("%.1f%%", 100 * rows / sum(rows)))
+kable(chain_tbl, caption = "Rows by chain (raw input)", col.names = c("Chain", "Rows", "Share"))
+```
+
+```{r year-cat-heatmap, fig.height=5}
+yc <- raw %>% count(year, category) %>% complete(year, category, fill = list(n = 0))
+ggplot(yc, aes(x = factor(year), y = category, fill = n)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = scales::comma(n)), size = 3, color = "white") +
+  scale_fill_viridis_c(option = "mako", end = 0.9, name = "Rows") +
+  labs(
+    title = "Rows by year x category (raw input)",
+    x = "Year",
+    y = "Category"
+  ) +
+  theme(panel.grid = element_blank())
+```
+
+# Data quality scan
+
+A comprehensive scan identified the following issues. The cleaning pipeline below addresses each.
+
+```{r dq-counts}
+# 1. Exact duplicates
+n_exact_dupes <- sum(duplicated(raw[, setdiff(names(raw), c("ts","month"))]))
+
+# 2. Encoding-duplicated names: collapse non-ASCII and \uXXXX to '?'
+collapse_name <- function(s) {
+  s <- gsub("\\\\u[0-9a-fA-F]{4}", "?", s)
+  s <- iconv(s, from = "", to = "ASCII", sub = "?")
+  s <- tolower(trimws(gsub("\\s+", " ", s)))
+  s
+}
+raw_collapsed <- collapse_name(raw$product_name)
+encoding_groups <- raw %>%
+  mutate(canon_key = raw_collapsed) %>%
+  group_by(canon_key) %>%
+  summarise(variants = list(unique(product_name)), .groups = "drop") %>%
+  mutate(n_variants = lengths(variants)) %>%
+  filter(n_variants > 1)
+n_encoding_collisions <- nrow(encoding_groups)
+n_rows_in_encoding_collisions <- sum(raw$product_name %in% unlist(encoding_groups$variants))
+
+# 3. Mixed-unit products
+prod_units <- raw %>%
+  filter(!is.na(unit)) %>%
+  group_by(product_name) %>%
+  summarise(units = list(sort(unique(unit))), n_units = n_distinct(unit), .groups = "drop")
+n_mixed_unit_products <- sum(prod_units$n_units > 1)
+
+# 4. Multi-price-per-snapshot
+multi_price_groups <- raw %>%
+  group_by(timestamp, chain, location, product_name) %>%
+  summarise(n_distinct_price = n_distinct(price), .groups = "drop") %>%
+  filter(n_distinct_price > 1)
+n_multi_price_groups <- nrow(multi_price_groups)
+n_rows_multi_price <- raw %>%
+  semi_join(multi_price_groups %>% select(timestamp, chain, location, product_name),
+            by = c("timestamp","chain","location","product_name")) %>%
+  nrow()
+
+# 5. Scraper-garbage entries
+garbage_re <- "( USD| Select Number of Trays|Serves:|All Varieties -)"
+n_garbage_rows <- sum(grepl(garbage_re, raw$product_name))
+n_garbage_products <- length(unique(raw$product_name[grepl(garbage_re, raw$product_name)]))
+
+# 6. Sparse 2020 obs per product
+n_2020 <- raw %>% filter(year == 2020) %>% count(product_name)
+n_products_single_2020 <- sum(n_2020$n == 1)
+n_products_le3_2020 <- sum(n_2020$n <= 3)
+
+# 7. Snapshot timing imbalance: count distinct months per (year)
+months_per_year <- raw %>% group_by(year) %>% summarise(n_months = n_distinct(month), .groups = "drop")
+
+# 8. Stale prices (zero variance over 6 years)
+stale <- raw %>%
+  group_by(product_name) %>%
+  summarise(n_uniq_price = n_distinct(price), n_years = n_distinct(year), .groups = "drop") %>%
+  filter(n_years == 6, n_uniq_price == 1)
+n_stale_products <- nrow(stale)
+
+# 9. Missing unit field
+n_missing_unit <- sum(is.na(raw$unit))
+
+# 10. Sale flag uniformly false (sanity)
+n_sale_true <- sum(raw$sale == "True", na.rm = TRUE)
+
+dq_tbl <- tibble(
+  Issue = c(
+    "1. Exact-row duplicates",
+    "2. Encoding-duplicated names (Macaroni & Cheese Entr??e variants)",
+    "3. Products with multiple unit labels (case/lb/bag mix)",
+    "4. Multi-distinct-price snapshots (package-size variants)",
+    "5. Scraper-garbage product entries",
+    "6. Products with single 2020 observation",
+    "7. Months covered per year (avg)",
+    "8. Zero-variance products across 6 years (stale catalog?)",
+    "9. Rows missing unit field",
+    "10. Sale-flag = TRUE rows (input was filtered)"
+  ),
+  Count = c(
+    format(n_exact_dupes, big.mark = ","),
+    paste0(n_encoding_collisions, " groups, ", format(n_rows_in_encoding_collisions, big.mark=","), " rows"),
+    paste0(n_mixed_unit_products, " products"),
+    paste0(format(n_multi_price_groups, big.mark=","), " groups, ", format(n_rows_multi_price, big.mark=","), " rows"),
+    paste0(format(n_garbage_rows, big.mark=","), " rows, ", n_garbage_products, " products"),
+    paste0(n_products_single_2020, " (of ", n_products_raw, ")"),
+    sprintf("%.1f", mean(months_per_year$n_months)),
+    paste0(n_stale_products, " products"),
+    format(n_missing_unit, big.mark = ","),
+    format(n_sale_true, big.mark = ",")
+  ),
+  Action = c(
+    "Drop with distinct()",
+    "Merge to canonical name (collapse non-ASCII to ?)",
+    "Treat (product, unit) as the indexing key",
+    "Use enrichment data (package_size_raw); else drop in robustness panel D",
+    "Drop products matching ' USD' / 'Select Number of Trays' / 'Serves:'",
+    "Robustness panel B re-runs index requiring >=3 obs in 2020",
+    "Aggregate price -> month -> year to neutralize timing imbalance",
+    "Robustness panel C re-runs index excluding zero-variance products",
+    "Use enrichment data; otherwise treat as 'no unit known'",
+    "Confirms input filter held"
+  )
+)
+kable(dq_tbl, caption = "Data-quality scan results (issues found in raw input)")
+```
+
+# Cleaning pipeline
+
+```{r clean}
+# Step 1: drop exact duplicates
+df <- raw %>%
+  distinct(timestamp, chain, location, product_name, price, unit, .keep_all = TRUE)
+n_after_dedup <- nrow(df)
+
+# Step 2: merge encoding-duplicated names. Replace with collapsed canonical form
+# but keep human-readable: pick the non-Unicode-escape form when possible.
+canon_map <- raw %>%
+  mutate(canon_key = collapse_name(product_name)) %>%
+  group_by(canon_key) %>%
+  summarise(canonical = product_name[which.min(grepl("\\\\u00", product_name) + grepl("[^\x01-\x7f]", product_name))],
+            .groups = "drop")
+df <- df %>%
+  mutate(canon_key = collapse_name(product_name)) %>%
+  left_join(canon_map, by = "canon_key") %>%
+  mutate(product_name = ifelse(is.na(canonical), product_name, canonical)) %>%
+  select(-canon_key, -canonical)
+
+# Step 3: drop scraper-garbage products
+df <- df %>% filter(!grepl(garbage_re, product_name))
+n_after_garbage <- nrow(df)
+
+# Step 4: derive an effective unit key
+# Priority:
+#   (a) if package_qty + package_qty_unit available from enrichment, use those
+#   (b) else fall back on the original `unit` column
+df <- df %>%
+  mutate(
+    eff_qty = ifelse(!is.na(package_qty) & package_qty > 0, package_qty, NA_real_),
+    eff_unit = ifelse(!is.na(package_qty_unit) & package_qty_unit != "", package_qty_unit,
+                      ifelse(is.na(unit), "unknown", unit)),
+    # Effective price per unit
+    eff_unit_price = ifelse(!is.na(unit_price) & unit_price > 0, unit_price, price)
+  )
+
+# Step 5: case-vs-lb price-magnitude correction
+# For products that have both case and lb listings, reclassify case rows whose
+# price is < 2x the product's median lb price as 'lb' (catches the GFS Ground
+# Beef artifact where wholesale-display prices were tagged 'case').
+case_lb_products <- df %>%
+  filter(eff_unit %in% c("case","lb")) %>%
+  group_by(product_name) %>%
+  summarise(units = list(unique(eff_unit)), .groups = "drop") %>%
+  filter(map_lgl(units, ~ all(c("case","lb") %in% .x)))
+
+case_corrections <- 0
+for (p in case_lb_products$product_name) {
+  med_lb <- df %>% filter(product_name == p, eff_unit == "lb") %>% pull(price) %>% median()
+  if (is.na(med_lb) || med_lb <= 0) next
+  bad_idx <- which(df$product_name == p & df$eff_unit == "case" & df$price < 2 * med_lb)
+  if (length(bad_idx) > 0) {
+    df$eff_unit[bad_idx] <- "lb"
+    case_corrections <- case_corrections + length(bad_idx)
+  }
+}
+
+# Step 6: drop multi-price snapshots that didn't get enriched
+# (these are package-size variants we couldn't disambiguate)
+unenriched_multi_price <- df %>%
+  group_by(timestamp, chain, location, product_name) %>%
+  summarise(
+    n_distinct_price = n_distinct(price),
+    any_enriched = any(enrichment_status == "ok"),
+    .groups = "drop"
+  ) %>%
+  filter(n_distinct_price > 1, !any_enriched)
+
+df_clean_strict <- df %>%
+  anti_join(unenriched_multi_price %>% select(timestamp, chain, location, product_name),
+            by = c("timestamp","chain","location","product_name"))
+n_after_strict <- nrow(df_clean_strict)
+
+# Step 6: build a (product_name, eff_unit, eff_qty) key
+df_clean_strict <- df_clean_strict %>%
+  mutate(item_key = paste(product_name, eff_unit,
+                          ifelse(is.na(eff_qty), "NA", as.character(eff_qty)),
+                          sep = " | "))
+
+# Step 7: outlier detection - drop individual observations whose price is
+# >5x the median price of OTHER observations of the same item-year. This
+# catches single-row decimal-point errors (e.g., $2.48 mistakenly typed
+# as $248.00) without removing legitimate price spikes.
+df_with_outlier_flag <- df_clean_strict %>%
+  group_by(item_key, year) %>%
+  mutate(
+    other_median = sapply(seq_len(n()), function(i) {
+      others <- price[-i]
+      if (length(others) == 0) return(NA_real_)
+      median(others, na.rm = TRUE)
+    }),
+    is_outlier = !is.na(other_median) & other_median > 0 & price > 5 * other_median
+  ) %>%
+  ungroup()
+n_outliers <- sum(df_with_outlier_flag$is_outlier, na.rm = TRUE)
+
+# Capture top outliers for the report
+top_outliers <- df_with_outlier_flag %>%
+  filter(is_outlier) %>%
+  mutate(ratio = price / other_median) %>%
+  arrange(desc(ratio)) %>%
+  slice_head(n = 10) %>%
+  transmute(
+    Item = item_key,
+    Year = year,
+    `Outlier price` = sprintf("$%.2f", price),
+    `Item-year median (others)` = sprintf("$%.2f", other_median),
+    `Ratio` = sprintf("%.1fx", ratio)
+  )
+
+df_clean_strict <- df_with_outlier_flag %>% filter(!is_outlier) %>% select(-other_median, -is_outlier)
+n_after_outlier <- nrow(df_clean_strict)
+
+# Export the cleaned dataset for the downstream parquet patch script.
+# This is df_clean_strict (post all data-cleaning steps, before the 6-year
+# basket-construction filter). The patch script uses
+# 20260429_karens_basket_coverage.csv to identify the original in-scope
+# parquet rows (anti-join key) and then concats this cleaned set in.
+readr::write_csv(
+  df_clean_strict,
+  file.path(root_dir, "analysis", "karens_basket_cleaned.csv")
+)
+message(sprintf("[export] wrote analysis/karens_basket_cleaned.csv (%d rows)", nrow(df_clean_strict)))
+
+# Step 8: Coverage - which item_keys are present in all 6 years AFTER outlier removal?
+key_year_cov <- df_clean_strict %>%
+  group_by(item_key) %>%
+  summarise(years = n_distinct(year), .groups = "drop")
+covered_keys <- key_year_cov %>% filter(years == 6) %>% pull(item_key)
+
+df_basket <- df_clean_strict %>% filter(item_key %in% covered_keys)
+n_basket_rows <- nrow(df_basket)
+n_basket_items <- length(unique(df_basket$item_key))
+
+clean_summary <- tibble(
+  Step = c(
+    "1. Drop exact-row duplicates",
+    "2. Merge encoding-duplicated names",
+    "3. Drop scraper-garbage products",
+    "4. Apply case-vs-lb price-magnitude correction",
+    "5. Drop unenriched multi-price snapshots",
+    "6. Build (product, unit, qty) item keys",
+    "7. Drop single-observation outliers (>5x same-year median)",
+    "8. Restrict to item keys present in all 6 years"
+  ),
+  `Rows after step` = c(
+    format(n_after_dedup, big.mark = ","),
+    format(n_after_dedup, big.mark = ","),
+    format(n_after_garbage, big.mark = ","),
+    format(n_after_garbage, big.mark = ","),
+    format(n_after_strict, big.mark = ","),
+    format(n_after_strict, big.mark = ","),
+    format(n_after_outlier, big.mark = ","),
+    format(n_basket_rows, big.mark = ",")
+  ),
+  Note = c(
+    paste(n_exact_dupes, "rows removed"),
+    paste(n_encoding_collisions, "groups merged"),
+    paste(n_garbage_rows, "rows removed"),
+    paste(case_corrections, "case rows reclassified as lb"),
+    paste(format(nrow(unenriched_multi_price), big.mark=","), "snapshots dropped"),
+    "(no rows removed)",
+    paste(n_outliers, "outlier rows removed"),
+    paste(n_basket_items, "items in final basket")
+  )
+)
+kable(clean_summary, caption = "Cleaning pipeline")
+```
+
+```{r outlier-table}
+if (n_outliers > 0) {
+  kable(top_outliers, caption = sprintf("Top single-observation outliers detected and removed (n=%d total)", n_outliers))
+}
+```
+
+The cleaned basket contains **`r n_basket_items` items** across `r length(unique(df_basket$chain))` chains, with **`r format(n_basket_rows, big.mark=",")` price observations**. The outlier-removal step caught `r n_outliers` single-row anomalies — most often missing-decimal-point errors in the source HTML (e.g., one observation of "$248.00" for a beef product priced $2.48 in every other observation across 6 years).
+
+# Product-level price detail
+
+```{r price-detail}
+# Compute per-item price summary by year
+prod_year <- df_basket %>%
+  group_by(item_key, product_name, eff_unit, year) %>%
+  summarise(
+    median_price = median(eff_unit_price, na.rm = TRUE),
+    n_obs = n(),
+    .groups = "drop"
+  )
+
+# Top movers: % change 2020 -> 2025
+movers <- prod_year %>%
+  filter(year %in% c(2020, 2025)) %>%
+  select(item_key, product_name, eff_unit, year, median_price) %>%
+  pivot_wider(names_from = year, values_from = median_price, names_prefix = "y") %>%
+  filter(!is.na(y2020) & !is.na(y2025) & y2020 > 0) %>%
+  mutate(pct_change = (y2025 - y2020) / y2020) %>%
+  arrange(desc(pct_change))
+
+top_up <- movers %>% slice_head(n = 10)
+top_down <- movers %>% slice_tail(n = 10) %>% arrange(pct_change)
+
+kable(
+  top_up %>%
+    transmute(Product = product_name, Unit = eff_unit,
+              `2020 ($)` = sprintf("%.2f", y2020),
+              `2025 ($)` = sprintf("%.2f", y2025),
+              `Change` = scales::percent(pct_change, accuracy = 0.1)),
+  caption = "Top 10 price increases 2020 -> 2025"
+)
+
+kable(
+  top_down %>%
+    transmute(Product = product_name, Unit = eff_unit,
+              `2020 ($)` = sprintf("%.2f", y2020),
+              `2025 ($)` = sprintf("%.2f", y2025),
+              `Change` = scales::percent(pct_change, accuracy = 0.1)),
+  caption = "Top 10 price decreases 2020 -> 2025"
+)
+```
+
+```{r staple-trajectories, fig.height=8}
+staples_target <- c(
+  "Macaroni & Cheese","Ground Beef","Salted Butter","American Cheese Slices",
+  "Hannaford Large Brown Eggs","Hannaford Whole Milk","Tomato Ketchup",
+  "Cream Cheese Loaf","All-Purpose Flour"
+)
+staples <- prod_year %>%
+  filter(product_name %in% staples_target) %>%
+  group_by(product_name, year) %>%
+  summarise(median_price = median(median_price, na.rm = TRUE), .groups = "drop")
+
+if (nrow(staples) > 0) {
+  ggplot(staples, aes(x = year, y = median_price, color = product_name)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 2.2) +
+    facet_wrap(~ product_name, scales = "free_y", ncol = 3) +
+    scale_x_continuous(breaks = 2020:2025) +
+    scale_y_continuous(labels = scales::dollar_format()) +
+    scale_color_brewer(palette = "Dark2") +
+    guides(color = "none") +
+    labs(
+      title = "Median price trajectories for selected staples",
+      x = NULL, y = "Median price"
+    )
+}
+```
+
+# Index construction
+
+We compute three classical price indices on the cleaned basket. Since our data has no quantities or expenditure shares, **fixed weights** are used (Paasche degenerates to Laspeyres under fixed weights; Fisher = sqrt(L * P) is reported as the standard summary).
+
+**Within-year aggregation:** for each item we take the median price within each (year, month), then the mean across months — this neutralizes lumpy snapshot timing.
+
+**Price relative:** \(r_{i,t} = \tilde{p}_{i,t} / \tilde{p}_{i,2020}\)
+
+**Laspeyres index:** \(L_t = \sum_i w_i^{2020} \cdot r_{i,t}\)
+
+**Paasche index:** \(P_t = \sum_i w_i^{t} \cdot r_{i,t}\) — under fixed weights this equals Laspeyres.
+
+**Fisher index:** \(F_t = \sqrt{L_t \cdot P_t}\)
+
+```{r build-relatives}
+# Annual price = mean over (year, month) medians
+item_annual <- df_basket %>%
+  group_by(item_key, product_name, eff_unit, year, month) %>%
+  summarise(monthly_median = median(eff_unit_price, na.rm = TRUE), .groups = "drop") %>%
+  group_by(item_key, product_name, eff_unit, year) %>%
+  summarise(annual_price = mean(monthly_median, na.rm = TRUE), .groups = "drop")
+
+# Pivot wide; keep only items with non-zero 2020 price
+item_wide <- item_annual %>%
+  pivot_wider(names_from = year, values_from = annual_price, names_prefix = "p")
+
+# Filter to items with valid 2020 anchor
+item_wide <- item_wide %>% filter(!is.na(p2020), p2020 > 0)
+
+# Compute relatives
+for (yr in 2020:2025) {
+  pcol <- paste0("p", yr)
+  rcol <- paste0("r", yr)
+  item_wide[[rcol]] <- item_wide[[pcol]] / item_wide[["p2020"]]
+}
+n_items_in_index <- nrow(item_wide)
+```
+
+The headline basket has **`r n_items_in_index` items** with valid 2020 anchor prices.
+
+```{r relative-distribution, fig.height=4}
+rel_long <- item_wide %>%
+  select(item_key, starts_with("r2"), -r2020) %>%
+  pivot_longer(-item_key, names_to = "year", values_to = "relative") %>%
+  mutate(year = sub("^r", "", year))
+
+ggplot(rel_long, aes(x = year, y = relative)) +
+  geom_hline(yintercept = 1, color = "#94a3b8", linetype = "dashed") +
+  geom_boxplot(fill = "#0f766e", alpha = 0.6, outlier.size = 0.6) +
+  scale_y_log10(labels = scales::number_format(accuracy = 0.1)) +
+  labs(
+    title = "Distribution of price relatives by year (log scale)",
+    subtitle = "Each box = the spread of price-relatives across all items",
+    x = "Year",
+    y = "Price relative (2020 = 1)"
+  )
+```
+
+# Headline index — equal product weights
+
+```{r build-indices}
+# Generic index builder
+compute_indices <- function(item_df, weights = NULL) {
+  if (is.null(weights)) {
+    weights <- rep(1 / nrow(item_df), nrow(item_df))
+  }
+  rels <- item_df %>% select(starts_with("r"))
+  out <- tibble(
+    year = 2020:2025,
+    laspeyres = NA_real_,
+    paasche = NA_real_,
+    fisher = NA_real_
+  )
+  for (i in seq_len(nrow(out))) {
+    yr <- out$year[i]
+    rcol <- paste0("r", yr)
+    r_vec <- item_df[[rcol]]
+    w <- weights
+    keep <- !is.na(r_vec) & is.finite(r_vec) & r_vec > 0
+    if (sum(keep) == 0) next
+    w_norm <- w[keep] / sum(w[keep])
+    L <- sum(w_norm * r_vec[keep])
+    P <- L  # Paasche = Laspeyres under fixed weights
+    out$laspeyres[i] <- L
+    out$paasche[i] <- P
+    out$fisher[i] <- sqrt(L * P)
+  }
+  out
+}
+
+# Equal product weights
+idx_equal <- compute_indices(item_wide)
+
+# Bootstrap CIs
+set.seed(20260429)
+boot_indices <- function(item_df, n_boot = 500) {
+  rels_mat <- as.matrix(item_df[, paste0("r", 2020:2025)])
+  n <- nrow(rels_mat)
+  out <- matrix(NA_real_, nrow = n_boot, ncol = 6)
+  for (b in seq_len(n_boot)) {
+    idx <- sample.int(n, n, replace = TRUE)
+    sub <- rels_mat[idx, , drop = FALSE]
+    means <- colMeans(sub, na.rm = TRUE)
+    out[b, ] <- means  # Laspeyres = Fisher under equal weights
+  }
+  apply(out, 2, function(x) c(lo = quantile(x, 0.05), hi = quantile(x, 0.95))) |> t()
+}
+
+ci <- boot_indices(item_wide, n_boot = 500)
+idx_equal$ci_lo <- ci[, "lo.5%"]
+idx_equal$ci_hi <- ci[, "hi.95%"]
+```
+
+```{r headline-plot, fig.height=4.5}
+ggplot(idx_equal, aes(x = year)) +
+  geom_ribbon(aes(ymin = ci_lo * 100, ymax = ci_hi * 100), fill = "#0f766e", alpha = 0.20) +
+  geom_line(aes(y = fisher * 100), color = "#0f172a", linewidth = 1.1) +
+  geom_point(aes(y = fisher * 100), color = "#0f172a", size = 2.5) +
+  geom_hline(yintercept = 100, linetype = "dashed", color = "#94a3b8") +
+  scale_x_continuous(breaks = 2020:2025) +
+  scale_y_continuous(labels = function(x) sprintf("%.0f", x)) +
+  labs(
+    title = "Karen's basket: Fisher index, equal product weights",
+    subtitle = sprintf(
+      "2020 = 100; cumulative inflation 2020-2025 = %s (5/95 bootstrap CI: %s - %s)",
+      scales::percent(idx_equal$fisher[6] - 1, accuracy = 0.1),
+      scales::percent(idx_equal$ci_lo[6] - 1, accuracy = 0.1),
+      scales::percent(idx_equal$ci_hi[6] - 1, accuracy = 0.1)
+    ),
+    x = NULL, y = "Index (2020=100)"
+  )
+
+idx_equal_table <- idx_equal %>%
+  transmute(
+    Year = year,
+    `Fisher index` = sprintf("%.1f", 100 * fisher),
+    `YoY change` = c("-", scales::percent(diff(fisher) / head(fisher, -1), accuracy = 0.1)),
+    `Cumulative since 2020` = scales::percent(fisher - 1, accuracy = 0.1),
+    `5/95 bootstrap CI` = sprintf("%.1f - %.1f", 100 * ci_lo, 100 * ci_hi)
+  )
+kable(idx_equal_table, caption = "Headline index, equal product weights, with 500-resample bootstrap CIs")
+```
+
+## Eggs decomposition
+
+Eggs in the US roughly doubled in price from 2020 to 2025 due to the H5N1 avian flu outbreak that began in 2022 (BLS series CUUR0000SEFL01 shows +186% over the same period). Several reviewers asked whether eggs are over-represented in the basket and dragging the headline up. The decomposition below answers that.
+
+```{r egg-decomp}
+item_wide_with_flag <- item_wide %>%
+  mutate(is_egg = grepl("\\b[Ee]gg", product_name))
+
+n_eggs <- sum(item_wide_with_flag$is_egg)
+n_non_eggs <- sum(!item_wide_with_flag$is_egg)
+
+idx_eggs <- compute_indices(filter(item_wide_with_flag, is_egg))
+idx_non_eggs <- compute_indices(filter(item_wide_with_flag, !is_egg))
+
+egg_decomp <- bind_rows(
+  mutate(idx_equal, group = sprintf("All items (n=%d)", n_items_in_index)),
+  mutate(idx_non_eggs, group = sprintf("Excluding eggs (n=%d)", n_non_eggs)),
+  mutate(idx_eggs, group = sprintf("Eggs only (n=%d)", n_eggs))
+)
+
+ggplot(egg_decomp, aes(x = year, y = fisher * 100, color = group)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.2) +
+  geom_hline(yintercept = 100, linetype = "dashed", color = "#94a3b8") +
+  scale_x_continuous(breaks = 2020:2025) +
+  scale_color_manual(values = c(setNames("#0f172a", sprintf("All items (n=%d)", n_items_in_index)),
+                                setNames("#0891b2", sprintf("Excluding eggs (n=%d)", n_non_eggs)),
+                                setNames("#dc2626", sprintf("Eggs only (n=%d)", n_eggs)))) +
+  labs(
+    title = "Eggs decomposition",
+    subtitle = "How much of the headline is driven by egg inflation?",
+    x = NULL, y = "Index (2020=100)",
+    color = NULL
+  )
+
+decomp_table <- egg_decomp %>%
+  filter(year == 2025) %>%
+  transmute(Group = group,
+            `Fisher 2025` = sprintf("%.1f", 100 * fisher),
+            `Cumulative 2020-2025` = scales::percent(fisher - 1, accuracy = 0.1))
+kable(decomp_table, caption = "Headline with and without eggs")
+```
+
+**Read:** eggs are `r round(100 * n_eggs / n_items_in_index, 1)`% of the basket items but `r sprintf("%.1f", (idx_eggs$fisher[6] - 1) * 100)`% inflated 2020-2025 (vs `r sprintf("%.1f", (idx_non_eggs$fisher[6] - 1) * 100)`% for everything else). Removing eggs reduces the headline by **`r sprintf("%.1fpp", (idx_equal$fisher[6] - idx_non_eggs$fisher[6]) * 100)`** (`r scales::percent(idx_equal$fisher[6] - 1, accuracy = 0.1)` -> `r scales::percent(idx_non_eggs$fisher[6] - 1, accuracy = 0.1)`). Eggs are real inflation, not a basket-construction artifact, but their disproportionate price rise means a basket that's heavy in eggs (relative to actual consumption) will overstate broad grocery inflation. NHANES weighting (Scheme C) is the most defensible mitigation since it down-weights any over-represented item to its consumption share.
+
+# Weighting sensitivity
+
+We compare the headline (Scheme A: equal product weights) to three alternative weighting schemes:
+
+- **A. Equal product weights** (headline): every item gets weight 1/N. No expenditure assumption.
+- **B. Equal category weights**: each of the 10 grocery categories gets 1/10, distributed equally across the items within that category. Compromise that prevents heavily-stocked categories like Dairy & Eggs from dominating.
+- **C. NHANES-informed**: category weights derived from NHANES `weighted_meals` shares mapped through `analysis/nhanes/category_group_lookup.csv` to our 10 categories. Most defensible expenditure proxy: it asks "what do American meals actually contain?" and lets that drive the weights. This is the scheme aligned with the project's stated NHANES-informed weighting goal.
+- **D. Observation-frequency**: each item is weighted by its share of *rows* in the cleaned basket (\(w_i = n_i / \sum_j n_j\)). This is **not** an expenditure share or a quantity share — it reflects how often the scraper happened to capture the item, which depends on Wayback snapshot density, page placement, and scraper retry behavior. It is included as a stress test: if it diverges sharply from the other schemes (as it does here, pushing the headline up), that signals the basket is dominated by a small number of heavily-scraped items whose price trajectory differs from the rest. It should not be read as a "true" expenditure-weighted index.
+
+```{r weighting-sensitivity}
+# Build category-level weights for items
+cat_lookup <- df_basket %>%
+  distinct(item_key, category)
+item_wide_cat <- item_wide %>% left_join(cat_lookup, by = "item_key")
+
+# Scheme B: equal category weights, distributed equally to items within category
+cat_sizes <- item_wide_cat %>% count(category, name = "n_items")
+cat_weights_B <- 1 / nrow(cat_sizes)  # 1/n_categories
+w_B <- 1 / nrow(cat_sizes) / cat_sizes$n_items[match(item_wide_cat$category, cat_sizes$category)]
+
+# Scheme C: NHANES-informed weights
+nhanes_path <- file.path(root_dir, "analysis", "nhanes", "category_group_lookup.csv")
+top_arch_path <- file.path(root_dir, "analysis", "nhanes", "top_archetypes.csv")
+have_nhanes <- file.exists(nhanes_path) && file.exists(top_arch_path)
+if (have_nhanes) {
+  nhanes_lkp <- read_csv(nhanes_path, show_col_types = FALSE)
+  top_arch <- read_csv(top_arch_path, show_col_types = FALSE)
+
+  # Map our 10 grocery categories to NHANES broad_groups
+  cat_to_nhanes <- tibble(
+    category = c(
+      "Beverages","Bread & Bakery","Dairy & Eggs","Frozen Foods","Household",
+      "Meat & Poultry","Pantry & Canned","Produce","Seafood","Snacks"
+    ),
+    nhanes_groups = list(
+      c("sweet_drink","coffee_tea","juice_smoothie","water","alcohol"),
+      c("bread"),
+      c("milk_dairy_drink","cheese","yogurt","eggs","condiment_fat"),
+      c("mixed_main"),
+      character(0),  # Household has no NHANES analog; will get mean weight
+      c("meat_poultry","breakfast_meat","seafood"),
+      c("grain_starch","cereal_oatmeal","beans_nuts","soup","condiment_fat"),
+      c("fruit","vegetables"),
+      c("seafood"),
+      c("salty_snack","sweet_baked")
+    )
+  )
+
+  # Sum NHANES weighted_share per broad_group from "all" stratum
+  nhanes_share <- top_arch %>%
+    filter(stratum == "all") %>%
+    mutate(top_groups_split = strsplit(top_groups, ",\\s*")) %>%
+    select(weighted_meals, top_groups_split) %>%
+    tidyr::unnest(top_groups_split) %>%
+    rename(broad_group = top_groups_split) %>%
+    group_by(broad_group) %>%
+    summarise(score = sum(weighted_meals, na.rm = TRUE), .groups = "drop")
+
+  cat_score <- cat_to_nhanes %>%
+    rowwise() %>%
+    mutate(score = sum(nhanes_share$score[nhanes_share$broad_group %in% nhanes_groups],
+                       na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(score = ifelse(score == 0, mean(score[score > 0], na.rm = TRUE), score)) %>%
+    mutate(weight = score / sum(score))
+
+  # Distribute equally within category
+  w_C_cat <- cat_score$weight[match(item_wide_cat$category, cat_score$category)]
+  w_C <- w_C_cat / cat_sizes$n_items[match(item_wide_cat$category, cat_sizes$category)]
+} else {
+  w_C <- rep(1 / nrow(item_wide), nrow(item_wide))
+}
+
+# Scheme D: observation-frequency weights (each item weighted by its share of basket rows)
+obs_count <- df_basket %>% count(item_key, name = "n_obs")
+w_D <- obs_count$n_obs[match(item_wide_cat$item_key, obs_count$item_key)]
+w_D <- w_D / sum(w_D, na.rm = TRUE)
+
+idx_A <- compute_indices(item_wide)
+idx_B <- compute_indices(item_wide_cat, weights = w_B)
+idx_C <- compute_indices(item_wide_cat, weights = w_C)
+idx_D <- compute_indices(item_wide_cat, weights = w_D)
+
+idx_compare <- bind_rows(
+  mutate(idx_A, scheme = "A: Equal product (headline)"),
+  mutate(idx_B, scheme = "B: Equal category"),
+  mutate(idx_C, scheme = "C: NHANES-informed"),
+  mutate(idx_D, scheme = "D: Observation-frequency")
+)
+
+ggplot(idx_compare, aes(x = year, y = fisher * 100, color = scheme)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 100, linetype = "dashed", color = "#94a3b8") +
+  scale_x_continuous(breaks = 2020:2025) +
+  scale_color_manual(
+    values = c(
+      "A: Equal product (headline)" = "#0f172a",
+      "B: Equal category" = "#1d4ed8",
+      "C: NHANES-informed" = "#16a34a",
+      "D: Observation-frequency" = "#dc2626"
+    )
+  ) +
+  labs(
+    title = "Weighting-scheme sensitivity",
+    x = NULL, y = "Fisher index (2020=100)",
+    color = NULL
+  )
+
+scheme_compare <- idx_compare %>%
+  filter(year == 2025) %>%
+  transmute(
+    Scheme = scheme,
+    `Fisher 2025` = sprintf("%.1f", 100 * fisher),
+    `Cumulative inflation 2020-2025` = scales::percent(fisher - 1, accuracy = 0.1)
+  )
+kable(scheme_compare, caption = "2020-2025 cumulative inflation by weighting scheme")
+```
+
+# Robustness sensitivity
+
+We re-run the headline index (equal product weights) under four robustness scenarios:
+
+- **A. Cleaned baseline** (the headline)
+- **B.** Restrict to items with >=3 observations in 2020 (mitigates thin base year)
+- **C.** Drop items with zero price variance over 6 years (mitigates stale catalog)
+- **D.** Drop items that ever had multi-distinct-price snapshots (more aggressive package-ambiguity defense than baseline)
+
+```{r robustness}
+# Compute these on item_wide (the headline basket)
+
+# B: items with >=3 obs in 2020
+obs2020 <- df_basket %>% filter(year == 2020) %>% count(item_key, name = "n_2020")
+keys_B <- obs2020 %>% filter(n_2020 >= 3) %>% pull(item_key)
+item_wide_B <- item_wide %>% filter(item_key %in% keys_B)
+
+# C: drop zero-variance items (those whose all 6 annual prices are equal)
+price_cols <- paste0("p", 2020:2025)
+var_per_item <- apply(as.matrix(item_wide[, price_cols]), 1, function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) < 2) return(0)
+  diff(range(x))
+})
+keys_C <- item_wide$item_key[var_per_item > 0]
+item_wide_C <- item_wide %>% filter(item_key %in% keys_C)
+
+# D: more aggressive: also drop items whose product_name had any unenriched multi-price
+# snapshot (already mostly excluded in main cleaning; this re-enforces)
+suspect_keys <- df %>%
+  group_by(timestamp, chain, location, product_name) %>%
+  summarise(n_pr = n_distinct(price), .groups = "drop") %>%
+  filter(n_pr > 1) %>%
+  distinct(product_name) %>%
+  pull(product_name)
+item_wide_D <- item_wide %>% filter(!product_name %in% suspect_keys)
+
+robust <- bind_rows(
+  mutate(compute_indices(item_wide),    scenario = sprintf("A. Baseline (n=%d)", nrow(item_wide))),
+  mutate(compute_indices(item_wide_B),  scenario = sprintf("B. >=3 obs in 2020 (n=%d)", nrow(item_wide_B))),
+  mutate(compute_indices(item_wide_C),  scenario = sprintf("C. Drop zero-variance (n=%d)", nrow(item_wide_C))),
+  mutate(compute_indices(item_wide_D),  scenario = sprintf("D. Drop multi-price products (n=%d)", nrow(item_wide_D)))
+)
+
+ggplot(robust, aes(x = year, y = fisher * 100, color = scenario)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 100, linetype = "dashed", color = "#94a3b8") +
+  scale_x_continuous(breaks = 2020:2025) +
+  labs(
+    title = "Robustness sensitivity",
+    subtitle = "Headline (A) vs. restricted-basket variants (B,C,D)",
+    x = NULL, y = "Fisher index (2020=100)",
+    color = NULL
+  )
+
+robust_table <- robust %>%
+  filter(year == 2025) %>%
+  transmute(Scenario = scenario,
+            `Fisher 2025` = sprintf("%.1f", 100 * fisher),
+            `Cumulative 2020-2025` = scales::percent(fisher - 1, accuracy = 0.1))
+kable(robust_table, caption = "Robustness sensitivity: cumulative inflation 2020-2025")
+
+# Headline range
+hl_range <- range(robust$fisher[robust$year == 2025] - 1, na.rm = TRUE)
+```
+
+**Honest answer:** across the four robustness scenarios, the cumulative 2020-2025 inflation lies in the range **`r scales::percent(hl_range[1], accuracy=0.1)` to `r scales::percent(hl_range[2], accuracy=0.1)`**.
+
+# Chain-stratified index
+
+The chain-stratified index is computed two ways: under **equal product weights** (Scheme A, the headline weighting) and under **NHANES-informed weights** (Scheme C, where each grocery category is weighted by NHANES national meal-frequency shares and that weight is distributed equally to items within the category). For each chain, the NHANES weights are renormalized within the chain so categories the chain doesn't carry don't drag the weight sum below 1.
+
+```{r chain-strat, fig.height=5}
+# Recompute index restricted to each chain.
+# `weighting` controls the per-item weight vector:
+#   "equal"  - equal product weights (matches the headline)
+#   "nhanes" - NHANES-informed category weights, distributed equally to
+#              items within category, renormalized within the chain
+chain_index <- function(chain_filter, weighting = "equal") {
+  sub <- df_basket %>% filter(chain_filter)
+  if (nrow(sub) == 0) return(NULL)
+  ann <- sub %>%
+    group_by(item_key, year, month) %>%
+    summarise(monthly_median = median(eff_unit_price, na.rm = TRUE), .groups = "drop") %>%
+    group_by(item_key, year) %>%
+    summarise(annual_price = mean(monthly_median, na.rm = TRUE), .groups = "drop")
+  wide <- ann %>% pivot_wider(names_from = year, values_from = annual_price, names_prefix = "p")
+  wide <- wide %>% filter(!is.na(p2020), p2020 > 0)
+  if (nrow(wide) == 0) return(NULL)
+  for (yr in 2020:2025) {
+    pcol <- paste0("p", yr); rcol <- paste0("r", yr)
+    wide[[rcol]] <- wide[[pcol]] / wide[["p2020"]]
+  }
+
+  if (weighting == "nhanes" && exists("cat_score")) {
+    # Attach categories to wide via the chain's items
+    chain_cat <- sub %>% distinct(item_key, category)
+    wide_cat <- wide %>% left_join(chain_cat, by = "item_key")
+    # Renormalize cat_score within the categories this chain has items in
+    chain_cat_score <- cat_score %>%
+      filter(category %in% wide_cat$category) %>%
+      mutate(weight = score / sum(score))
+    chain_cat_sizes <- wide_cat %>% count(category, name = "n_items")
+    w_chain <- chain_cat_score$weight[match(wide_cat$category, chain_cat_score$category)] /
+               chain_cat_sizes$n_items[match(wide_cat$category, chain_cat_sizes$category)]
+    compute_indices(wide_cat, weights = w_chain) %>% mutate(n_items = nrow(wide))
+  } else {
+    compute_indices(wide) %>% mutate(n_items = nrow(wide))
+  }
+}
+
+# Chain filters reused by both weightings
+.is_hannaford <- df_basket$chain == "Hannaford Supermarket & Pharmacy"
+.is_gfs       <- df_basket$chain == "Gordon Food Service Store Mp183"
+.is_other     <- !(df_basket$chain %in% c("Hannaford Supermarket & Pharmacy",
+                                          "Gordon Food Service Store Mp183"))
+
+# Equal-weight (headline) version
+idx_hannaford <- chain_index(.is_hannaford, "equal")
+idx_gfs       <- chain_index(.is_gfs,       "equal")
+idx_other     <- chain_index(.is_other,     "equal")
+
+build_chain_label <- function(name, idx) {
+  if (is.null(idx)) return(NULL)
+  mutate(idx, chain = sprintf("%s (n=%d)", name, idx$n_items[1]))
+}
+
+chain_stack <- bind_rows(
+  build_chain_label("Hannaford", idx_hannaford),
+  build_chain_label("GFS", idx_gfs),
+  build_chain_label("Other chains", idx_other)
+)
+
+if (nrow(chain_stack) > 0) {
+  ggplot(chain_stack, aes(x = year, y = fisher * 100, color = chain)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 2) +
+    geom_hline(yintercept = 100, linetype = "dashed", color = "#94a3b8") +
+    scale_x_continuous(breaks = 2020:2025) +
+    labs(
+      title = "Chain-stratified Fisher index (equal product weights)",
+      subtitle = "Are Hannaford and GFS telling the same story?",
+      x = NULL, y = "Index (2020=100)",
+      color = NULL
+    )
+}
+```
+
+```{r chain-strat-nhanes, fig.height=5}
+# NHANES-informed weighting version
+idx_hannaford_n <- chain_index(.is_hannaford, "nhanes")
+idx_gfs_n       <- chain_index(.is_gfs,       "nhanes")
+idx_other_n     <- chain_index(.is_other,     "nhanes")
+
+chain_stack_n <- bind_rows(
+  build_chain_label("Hannaford", idx_hannaford_n),
+  build_chain_label("GFS", idx_gfs_n),
+  build_chain_label("Other chains", idx_other_n)
+)
+
+if (nrow(chain_stack_n) > 0) {
+  ggplot(chain_stack_n, aes(x = year, y = fisher * 100, color = chain)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 2) +
+    geom_hline(yintercept = 100, linetype = "dashed", color = "#94a3b8") +
+    scale_x_continuous(breaks = 2020:2025) +
+    labs(
+      title = "Chain-stratified Fisher index (NHANES-informed weights)",
+      subtitle = "Same chains, weighted by national meal-frequency shares",
+      x = NULL, y = "Index (2020=100)",
+      color = NULL
+    )
+}
+```
+
+```{r chain-strat-table}
+# Comparison table: 2025 cumulative inflation per chain x weighting
+extract_2025 <- function(idx) {
+  if (is.null(idx)) return(NA_real_)
+  idx$fisher[idx$year == 2025] - 1
+}
+
+chain_compare <- tibble(
+  Chain = c("Hannaford", "GFS Mp183", "Other chains"),
+  n_items = c(
+    if (!is.null(idx_hannaford)) idx_hannaford$n_items[1] else NA_integer_,
+    if (!is.null(idx_gfs))       idx_gfs$n_items[1]       else NA_integer_,
+    if (!is.null(idx_other))     idx_other$n_items[1]     else NA_integer_
+  ),
+  equal_2025  = c(extract_2025(idx_hannaford),  extract_2025(idx_gfs),   extract_2025(idx_other)),
+  nhanes_2025 = c(extract_2025(idx_hannaford_n), extract_2025(idx_gfs_n), extract_2025(idx_other_n))
+)
+
+cross_chain_range <- function(v) {
+  v <- v[!is.na(v)]
+  if (length(v) < 2) return(NA_real_)
+  diff(range(v))
+}
+
+chain_compare_display <- chain_compare %>%
+  transmute(
+    Chain,
+    `Items (n)` = format(n_items, big.mark = ","),
+    `Equal weights (A)` = scales::percent(equal_2025,  accuracy = 0.1),
+    `NHANES (C)`        = scales::percent(nhanes_2025, accuracy = 0.1)
+  ) %>%
+  bind_rows(
+    tibble(
+      Chain = "Cross-chain range",
+      `Items (n)` = "",
+      `Equal weights (A)` = sprintf("%.1f pp", 100 * cross_chain_range(chain_compare$equal_2025)),
+      `NHANES (C)`        = sprintf("%.1f pp", 100 * cross_chain_range(chain_compare$nhanes_2025))
+    )
+  )
+
+kable(chain_compare_display,
+      caption = "Cumulative inflation 2020 -> 2025, by chain and weighting scheme",
+      align = c("l", "r", "r", "r"))
+```
+
+The cross-chain range tells you how much "chain choice" matters for inflation: a wider range means the chains diverge more on what their basket of items has done. Under NHANES weighting, that range typically shifts because chains with more items in NHANES-heavy categories (eggs, dairy, meat) get pulled toward the basket's category-weighted average, while chains with idiosyncratic offerings (e.g., GFS's wholesale-format catalog) move differently.
+
+# BLS Food-at-Home overlay
+
+The Bureau of Labor Statistics publishes the Consumer Price Index for All Urban Consumers (CPI-U), Food at Home (series CUUR0000SAF11). Below we overlay our headline index against BLS annual averages for context.
+
+```{r bls-overlay, fig.height=4.5}
+# BLS CPI-U Food at Home (CUUR0000SAF11) annual averages, 1982-1984 = 100
+# Source: https://data.bls.gov/timeseries/CUUR0000SAF11
+bls_fah <- tibble(
+  year = 2020:2025,
+  cpi  = c(280.804, 290.768, 322.272, 348.039, 359.832, 367.985)
+)
+bls_fah <- bls_fah %>% mutate(index2020 = cpi / cpi[1] * 100)
+
+merged <- idx_equal %>%
+  transmute(year, ours = fisher * 100, ours_lo = ci_lo * 100, ours_hi = ci_hi * 100) %>%
+  left_join(bls_fah %>% select(year, bls = index2020), by = "year")
+
+merged_long <- merged %>%
+  select(year, ours, bls) %>%
+  pivot_longer(c(ours, bls), names_to = "series", values_to = "value")
+
+ggplot() +
+  geom_ribbon(data = merged, aes(x = year, ymin = ours_lo, ymax = ours_hi),
+              fill = "#0f766e", alpha = 0.15) +
+  geom_line(data = merged_long, aes(x = year, y = value, color = series), linewidth = 1.1) +
+  geom_point(data = merged_long, aes(x = year, y = value, color = series), size = 2.2) +
+  geom_hline(yintercept = 100, linetype = "dashed", color = "#94a3b8") +
+  scale_color_manual(values = c(ours = "#0f172a", bls = "#dc2626"),
+                     labels = c(ours = "Karen's basket (Fisher, equal weights)",
+                                bls = "BLS CPI-U Food at Home")) +
+  scale_x_continuous(breaks = 2020:2025) +
+  labs(
+    title = "Karen's basket vs. BLS Food-at-Home CPI",
+    subtitle = sprintf(
+      "Karen 2025: %.1f  |  BLS 2025: %.1f  (both indexed to 2020=100)",
+      merged$ours[6], merged$bls[6]
+    ),
+    x = NULL, y = "Index (2020=100)",
+    color = NULL
+  )
+
+bls_table <- merged %>%
+  transmute(
+    Year = year,
+    `Karen's basket` = sprintf("%.1f", ours),
+    `Karen's CI` = sprintf("%.1f - %.1f", ours_lo, ours_hi),
+    `BLS Food-at-Home` = sprintf("%.1f", bls)
+  )
+kable(bls_table, caption = "Karen's basket vs. BLS Food-at-Home CPI, 2020 = 100")
+```
+
+# Validity caveats
+
+Even after the cleaning pipeline, several limitations remain. The reader should treat the headline number as an order-of-magnitude estimate, not a precision instrument:
+
+1. **Chain concentration.** `r round(100 * sum(raw$chain %in% c("Hannaford Supermarket & Pharmacy","Gordon Food Service Store Mp183")) / n_rows_raw, 1)`% of rows come from two chains (Hannaford, GFS). This is much closer to a "Hannaford+GFS price story" than to "American grocery prices."
+2. **Geographic concentration.** Hannaford is a Northeast chain (NH/ME/VT/NY/MA); GFS Mp183 is a single-store identifier. The basket does not reflect Sunbelt or Pacific pricing.
+3. **GFS retail vs. wholesale mixing.** GFS sells to both home and business customers; many products appear in both retail (per-lb) and wholesale (case) listings. Our case-vs-lb price-magnitude rule corrects the obvious cases but cannot detect every misattribution.
+4. **Package size unknowns for non-Hannaford/GFS rows.** The re-scrape covered only Hannaford and GFS. Products from the other 13 chains keep their original (often missing) `unit` field.
+5. **Sparse 2020 base.** Of `r n_products_raw` raw products, `r n_products_single_2020` had a single 2020 observation; the bootstrap CI quantifies but does not eliminate this noise.
+6. **No quantities.** Without expenditure shares, all weighting schemes are heuristic. NHANES-informed weights are a defensible proxy but are based on national consumption averages, not basket purchase patterns.
+7. **Wayback snapshot timing is irregular** within years. The month -> year aggregation reduces but does not eliminate timing artifacts.
+8. **Sale-flag reliability** depends on each retailer's labeling. The user's filter ("non-sale") survives only if retailers tagged sales correctly.
+9. **Encoding-merged products** are now combined, but if a non-Hannaford retailer had different encoding artifacts we did not detect, those would still double-count.
+10. **Index is fixed-weight throughout.** A true Paasche calculation requires period-specific quantities, which we lack; under fixed weights Paasche = Laspeyres and Fisher = sqrt(L*P) = L. We report the three to maintain the convention but note the equivalence.
+
+# Sources & reproducibility
+
+The headline metric grid is at the [top of this report](#headline). The numbers there are computed from the cleaned basket; the body sections above show the full derivation, sensitivity panels, and caveats.
+
+---
+
+*Inputs: `20260429_karens_basket_coverage.csv` (filtered non-sale subset of the project app, exported 2026-04-29). `analysis/karens_basket_enriched.csv` (Hannaford+GFS package-size enrichment via Wayback re-scrape, generated by `scripts/rescrape_basket_sizes.py`). NHANES weights via `analysis/nhanes/category_group_lookup.csv` and `analysis/nhanes/top_archetypes.csv`. BLS series CUUR0000SAF11.*
+
+*Reproducibility: render with `./scripts/run-r.sh -e "rmarkdown::render('analysis/karens_basket_inflation.Rmd')"` from project root.*

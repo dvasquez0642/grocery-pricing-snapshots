@@ -1,0 +1,16 @@
+chain,rows,unique_years,location_types
+European Deli,271310,6,chain-wide
+Hannaford Supermarket & Pharmacy,86383,6,store-specific
+H Mart,70638,2,chain-wide
+Olive May Health Food Store,57689,3,chain-wide
+Hays Food Town,53218,6,"chain-wide, city-level, unknown"
+Highlands Organic Market,33217,6,city-level
+Garcia Plaza Bakery,31163,2,chain-wide
+Amish Manhattan Farmers Market,22667,4,unknown
+Wild Fork Foods,19203,4,chain-wide
+Stew Leonard's,18751,6,chain-wide
+Striplings General Store,18573,6,chain-wide
+Gordon Food Service Store Mp131,17268,6,unknown
+ShopRite,17177,5,"city-level, store-specific, unknown"
+Joseph's Classic Market,15475,3,chain-wide
+Rouses Market,15202,6,chain-wide

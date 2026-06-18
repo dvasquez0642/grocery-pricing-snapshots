@@ -1,0 +1,3 @@
+source_name,path,snapshot_utc,notes,rows_in_report_scope
+pricing_parquet,data/pricing.parquet,2026-04-08T18:49:44.787188530+00:00,Observation-level analytic snapshot used by the Streamlit app.,1181102
+confirmed_store_registry,wayback grocery AO/data/confirmed_stores.csv,2026-04-07T18:51:32.455784082+00:00,Mission-qualified store registry maintained in the Wayback AO workspace.,59

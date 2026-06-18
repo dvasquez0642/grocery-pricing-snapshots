@@ -1,0 +1,9 @@
+metric,value
+registry_entries,59
+full_2020_2025_entries,49
+partial_entries,10
+entries_with_total_rows_recorded,52
+entries_with_non_sale_rows_recorded,21
+full_coverage_recorded_total_rows,313573
+full_coverage_recorded_non_sale_rows,173926
+blank_location_fields,26

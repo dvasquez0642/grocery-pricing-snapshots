@@ -1,0 +1,468 @@
+---
+title: "Karen's Basket — Perturbation Analysis"
+subtitle: "Data-quality audit and Karen-adjacent alternative baskets"
+author: "Grocery Pricing Project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+root_dir <- getwd()
+
+# Allow running from repo root or from analysis/.
+if (!file.exists(file.path(root_dir, "scripts", "run-r.sh"))) {
+  candidate_root <- normalizePath(file.path(root_dir, ".."), winslash = "/", mustWork = FALSE)
+  if (file.exists(file.path(candidate_root, "scripts", "run-r.sh"))) {
+    root_dir <- candidate_root
+  } else {
+    stop("Run this document from the repo root or from analysis/.", call. = FALSE)
+  }
+}
+
+library(dplyr)
+library(ggplot2)
+library(htmltools)
+library(knitr)
+library(readr)
+library(scales)
+library(stringr)
+library(tidyr)
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 5.5,
+  out.width = "100%"
+)
+
+theme_set(
+  theme_minimal(base_size = 14) +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title.position = "plot",
+      plot.caption.position = "plot"
+    )
+)
+
+sandbox_dir <- file.path(root_dir, "analysis", "sandbox", "karens_basket_perturbation")
+
+required_files <- c(
+  "qc_table.csv",
+  "per_label_year_rows.csv",
+  "candidate_substitutes.csv",
+  "perturbed_baskets.csv",
+  "sample_matches.csv",
+  "label_year_index.csv",
+  "basket_year_index.csv"
+)
+
+missing_required <- required_files[!file.exists(file.path(sandbox_dir, required_files))]
+if (length(missing_required) > 0) {
+  stop(
+    paste(
+      "Missing sandbox inputs:",
+      paste(missing_required, collapse = ", "),
+      ". Run python analysis/sandbox/karens_basket_perturbation/build_qc.py and ",
+      "build_indices.py first."
+    ),
+    call. = FALSE
+  )
+}
+
+qc          <- read_csv(file.path(sandbox_dir, "qc_table.csv"), show_col_types = FALSE)
+year_rows   <- read_csv(file.path(sandbox_dir, "per_label_year_rows.csv"), show_col_types = FALSE)
+candidates  <- read_csv(file.path(sandbox_dir, "candidate_substitutes.csv"), show_col_types = FALSE)
+baskets     <- read_csv(file.path(sandbox_dir, "perturbed_baskets.csv"), show_col_types = FALSE)
+samples     <- read_csv(file.path(sandbox_dir, "sample_matches.csv"), show_col_types = FALSE)
+label_idx   <- read_csv(file.path(sandbox_dir, "label_year_index.csv"), show_col_types = FALSE)
+basket_idx  <- read_csv(file.path(sandbox_dir, "basket_year_index.csv"), show_col_types = FALSE)
+
+basket_levels <- c("Karen-Original", "Karen-Lean", "Karen-Robust", "Karen-Broad")
+basket_idx$basket <- factor(basket_idx$basket, levels = basket_levels)
+```
+
+# Mission
+
+The 60-item Karen's Basket (defined in `target_items.py`) is the project's
+reference basket for U.S. grocery inflation in 2020-2025.  This report
+*perturbs* that basket: starting from the same 60 conceptual targets, it
+runs a data-quality audit, identifies items whose underlying parquet support
+is weak, mines parquet-verified substitutes for the same grocery roles, and
+proposes three alternative baskets (`Karen-Lean`, `Karen-Robust`,
+`Karen-Broad`) for sensitivity analysis.
+
+The goal is **plausible, robust, Karen-adjacent meals**: every alternative
+preserves Karen's spirit (everyday American groceries) while improving
+the chain breadth, year coverage, and unit homogeneity of the underlying
+panel.
+
+The full master parquet at `data/pricing.parquet` is the data source —
+`r format(nrow(label_idx[label_idx$basket == 'Karen-Original',]), big.mark = ',')`
+label-year price observations after filtering to 2020-2025 non-sale rows.
+
+# Data-quality audit of the 60 Karen items
+
+For every Karen label we matched the `target_items.py` regex against unique
+product names in the full parquet (2020-2025, non-sale only).  For each label
+we then computed:
+
+- `n_rows` — total matched rows
+- `n_chains` — distinct chains contributing
+- `n_years` — distinct years (out of 6) with at least one observation
+- `dominant_unit` and `unit_homogeneity` — share of rows whose `unit` field
+  matches the most common value
+- `iqr_over_median` — robust price dispersion
+- `outlier_share` — average within-year share of Tukey-fence outliers on
+  log price
+- a `verdict` and a one-line `verdict_reason`.
+
+```{r verdict-summary}
+verdict_levels <- c("keep", "keep-tighten", "replace", "drop")
+qc$verdict <- factor(qc$verdict, levels = verdict_levels)
+
+verdict_summary <- qc |>
+  count(verdict, .drop = FALSE) |>
+  mutate(
+    pct = n / sum(n),
+    pct_label = percent(pct, accuracy = 0.1)
+  )
+
+knitr::kable(
+  verdict_summary,
+  col.names = c("Verdict", "n labels", "Share", "Share %"),
+  caption = "Verdict distribution across the 60 Karen labels"
+)
+```
+
+In the current snapshot every Karen label matches enough data to clear the
+'drop' threshold (`n_rows >= 25` and `n_years >= 3`), so the audit splits
+into **keep** and **keep-tighten**.  The keep-tighten flag mostly catches
+unit-field heterogeneity (many chains expose blank or inconsistent units)
+and a handful of high-IQR-over-median labels driven by package-size mixing.
+
+## Coverage by year
+
+```{r coverage-heatmap, fig.height = 12}
+heatmap_df <- year_rows |>
+  mutate(label = factor(label, levels = qc$label[order(qc$n_rows)]))
+
+ggplot(heatmap_df, aes(x = factor(year), y = label, fill = n_rows)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_gradient(
+    low = "#f7fbff", high = "#08519c",
+    trans = "log10",
+    labels = scales::comma_format(),
+    name = "Rows (log10)"
+  ) +
+  labs(
+    title = "Karen labels — rows per year (full parquet, non-sale)",
+    subtitle = "Sorted by total rows; pale cells = thin support; missing cell = no data that year",
+    x = "Year", y = NULL
+  ) +
+  theme(
+    axis.text.y = element_text(size = 8),
+    panel.grid = element_blank()
+  )
+```
+
+## Per-label QC table
+
+The full table sorted by verdict and then descending row count.  Items most
+in need of tightening are those with `unit_homogeneity` below 0.5 or
+`iqr_over_median` above 1.5 — they appear at the top of the keep-tighten
+group.
+
+```{r qc-table}
+qc_show <- qc |>
+  arrange(verdict, desc(n_rows)) |>
+  transmute(
+    Label = label,
+    Verdict = as.character(verdict),
+    Years = n_years,
+    Chains = n_chains,
+    Rows = comma(n_rows),
+    `Dominant unit` = ifelse(is.na(dominant_unit) | dominant_unit == "",
+                              "(blank)", dominant_unit),
+    `Unit homog.` = sprintf("%.0f%%", 100 * unit_homogeneity),
+    `IQR / median` = sprintf("%.2f", iqr_over_median),
+    `Outlier %` = sprintf("%.1f%%", 100 * outlier_share),
+    Reason = verdict_reason
+  )
+
+knitr::kable(
+  qc_show,
+  caption = "Per-Karen-label QC stats with verdict and one-line reason"
+)
+```
+
+## Worst offenders — examples
+
+For the labels with the lowest unit homogeneity or the highest dispersion,
+the most common matched product names give a feel for *why* the panel is
+noisy:
+
+```{r worst-offenders}
+worst <- qc |>
+  filter(verdict == "keep-tighten") |>
+  arrange(unit_homogeneity) |>
+  head(8) |>
+  pull(label)
+
+samples |>
+  filter(label %in% worst) |>
+  group_by(label) |>
+  slice_max(rows, n = 5, with_ties = FALSE) |>
+  ungroup() |>
+  transmute(Label = label, `Product name` = product_name, Rows = rows) |>
+  knitr::kable(
+    caption = "Eight 'keep-tighten' labels and their top 5 matched product names. The mix of package sizes / variants is what drives the unit and price-dispersion flags."
+  )
+```
+
+# Karen-adjacent candidate items
+
+We mined the parquet for **`r nrow(candidates)`** Karen-adjacent themes
+(breakfast staples, sandwich components, dinner proteins, sides, pantry,
+dairy, frozen, beverages, snacks, bread).  Every theme below has at
+least one parquet match in 2020-2025 non-sale rows.
+
+```{r candidates-table}
+cand_show <- candidates |>
+  arrange(desc(robustness_score)) |>
+  transmute(
+    Theme = theme,
+    Label = label,
+    Years = n_years,
+    Chains = n_chains,
+    Rows = comma(n_rows),
+    `Median $` = dollar(median_price, accuracy = 0.01),
+    `Dominant unit` = ifelse(is.na(dominant_unit) | dominant_unit == "",
+                              "(blank)", dominant_unit),
+    Examples = top_examples
+  )
+
+knitr::kable(
+  cand_show,
+  caption = paste0(
+    "Karen-adjacent candidate items, sorted by a robustness score = ",
+    "n_years * 100 + n_chains * 5 + log10(n_rows + 1). ",
+    "All shown candidates have 6/6 year coverage in the parquet."
+  )
+)
+```
+
+A striking finding: every candidate listed above clears 6/6 year coverage,
+and most clear 50+ chains — better support than many of the original Karen
+items.  This is mainly because Karen's regex set is narrow and brand-anchored
+(e.g., `Bertoli Marinara`, `Welch's Grape Jelly`, `Folgers Coffee`),
+whereas these candidates use category-level patterns (e.g., `bacon`,
+`olive oil`, `salmon`).
+
+# Three perturbed baskets
+
+```{r basket-sizes}
+basket_sizes <- baskets |>
+  count(basket_name) |>
+  rename(Basket = basket_name, `Items` = n) |>
+  arrange(match(Basket, basket_levels))
+knitr::kable(basket_sizes, caption = "Item count per perturbed basket")
+```
+
+## Karen-Lean — the strict floor
+
+`Karen-Lean` keeps only the Karen items that earned `verdict == 'keep'`
+**and** had `n_years >= 5` **and** `n_chains >= 3`.  It is the most
+conservative basket: every item is well-supported by the parquet, but the
+basket is small, so the resulting index is more vulnerable to single-item
+volatility (note the 2021 dip in section 5).
+
+```{r lean-items}
+baskets |>
+  filter(basket_name == "Karen-Lean") |>
+  arrange(desc(n_rows)) |>
+  transmute(Label = label, Years = n_years, Chains = n_chains,
+            Rows = comma(n_rows), Source = source) |>
+  knitr::kable(caption = "Karen-Lean: items that survive strict QC.")
+```
+
+## Karen-Robust — Karen with role-matched substitutes
+
+`Karen-Robust` starts from `Karen-Lean` and refills each missing
+**conceptual role** (e.g., deli turkey, sandwich bread, bacon, sliced
+cheese) with the strongest parquet-verified candidate that fits that role.
+This is the primary recommendation for sensitivity analysis: it preserves
+Karen's structure while patching the items where Karen's narrow
+brand-anchored regex made the panel brittle.
+
+```{r robust-items}
+baskets |>
+  filter(basket_name == "Karen-Robust") |>
+  arrange(source, desc(n_rows)) |>
+  transmute(Label = label, Years = n_years, Chains = n_chains,
+            Rows = comma(n_rows), Source = source) |>
+  knitr::kable(caption = "Karen-Robust: lean items + parquet-verified substitutes for the dropped Karen roles.")
+```
+
+## Karen-Broad — Karen plus adjacent items
+
+`Karen-Broad` keeps **all** 60 original Karen items and adds every
+non-redundant adjacent candidate with `n_years == 6` and `n_rows >= 100`.
+This basket is the broadest sensitivity test: if our inflation conclusions
+hold under Karen-Broad, they're not artefacts of the original 60-item
+selection.
+
+```{r broad-summary}
+broad <- baskets |> filter(basket_name == "Karen-Broad")
+
+added_only <- broad |>
+  filter(!str_starts(source, "karen-original"))
+
+knitr::kable(
+  added_only |>
+    arrange(desc(n_rows)) |>
+    transmute(Label = label, Years = n_years, Chains = n_chains,
+              Rows = comma(n_rows), Source = source),
+  caption = paste0(
+    "Karen-Broad ADDITIONS only (the 60 Karen items are also included in this basket). ",
+    nrow(added_only), " items added, drawn entirely from parquet matches."
+  )
+)
+```
+
+# Comparison: how does basket choice move the inflation curve?
+
+For each of the four baskets we compute a simple geometric-mean Laspeyres
+index, base 2020 = 1.0, using median price by year per label.  The basket
+index for a given year is the unweighted geomean of its per-label indices
+that have a 2020 baseline.
+
+This is intentionally a quick sensitivity tool, not a publication-grade
+index — see *Caveats* below.
+
+```{r basket-index-plot, fig.height = 5}
+basket_colors <- c(
+  "Karen-Original" = "#222222",
+  "Karen-Lean"     = "#d95f02",
+  "Karen-Robust"   = "#1b9e77",
+  "Karen-Broad"    = "#7570b3"
+)
+
+ggplot(basket_idx, aes(x = year, y = laspeyres_geomean_index,
+                       color = basket, group = basket)) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey50") +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = basket_colors, name = NULL) +
+  scale_x_continuous(breaks = 2020:2025) +
+  scale_y_continuous(labels = number_format(accuracy = 0.01)) +
+  labs(
+    title = "Geomean-Laspeyres index by basket, base 2020 = 1.0",
+    subtitle = "Per-label index = median(price) / median(price)_2020. Basket index = geomean across labels.",
+    x = NULL, y = "Index (2020 = 1.0)",
+    caption = "Source: data/pricing.parquet, 2020-2025, non-sale only"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+```{r basket-index-table}
+basket_idx |>
+  transmute(
+    Basket = basket,
+    Year = year,
+    Index = sprintf("%.3f", laspeyres_geomean_index),
+    `% vs 2020` = sprintf("%+.1f%%", pct_change_vs_2020)
+  ) |>
+  pivot_wider(names_from = Year, values_from = c(Index, `% vs 2020`)) |>
+  knitr::kable(caption = "Geomean-Laspeyres index by basket and year (base 2020 = 1.0)")
+```
+
+## Reading the comparison
+
+- **Karen-Original (60 items, black)** sits in the middle of the pack and is
+  the project's existing reference.
+- **Karen-Lean (23 items, orange)** is the most volatile — a single big
+  mover (e.g., milk or eggs) can swing the basket measurably, hence the
+  visible 2021 dip.  Its end-2025 reading is the lowest of the four
+  baskets, partly an artefact of small panel size.
+- **Karen-Robust (28 items, green)** is the recommended sensitivity check.
+  By replacing brand-anchored Karen items with category-level substitutes,
+  it gives a smoother trajectory through 2022-2023 and ends at a level
+  consistent with Karen-Original.  The 2023 spike (+24.9% vs 2020) is
+  driven mainly by the 2023 fresh-protein price surge picked up by the
+  generic chicken-thigh / bone-in chicken substitutes.
+- **Karen-Broad (106 items, purple)** has the smoothest curve and the
+  highest end-2025 reading (+23.7% vs 2020), reflecting the Karen-adjacent
+  produce + frozen-pizza items that compound through the period.  Its
+  larger panel damps single-item volatility, so it's the best basket for a
+  *direction-of-travel* check on Karen's inflation conclusion.
+
+The qualitative finding — non-trivial cumulative grocery inflation between
+2020 and 2025 — holds across all four baskets.  The point estimate ranges
+from roughly +4% (Karen-Lean, sensitive to small panel) to +24% (Karen-Broad).
+Karen-Original (+14.6%) and Karen-Robust (+13.3%) bracket the middle.
+
+# Caveats
+
+1. **Median, not weighted average.**  Per-label price for a given year is
+   the median of all matching parquet rows (across chains, package sizes,
+   etc.).  No NHANES intake weighting, no quantity weighting.  This makes
+   the index simple and reproducible, but it does not represent any
+   particular household's spending pattern.
+
+2. **Geomean of unequal panels.**  We take an unweighted geomean of
+   per-label indices.  Labels with thin panels count the same as labels
+   with thousands of rows.  This is appropriate for the intent of the
+   exercise (basket-composition sensitivity) but would be wrong for an
+   official inflation statistic.
+
+3. **Pattern leakage.**  Karen's regex set is narrow but not perfect.
+   Examples surfaced in section 2.4 — e.g., `Tomato (hot house)` falls
+   back to a generic `tomato` pattern, dragging in roma tomatoes and
+   tomato sauce.  The candidate themes use tighter category patterns but
+   are not regression-tested.
+
+4. **Regional skew.**  The parquet is dominated by chains in specific
+   regions (e.g., Hannaford in the Northeast).  No basket here corrects
+   for that.  All conclusions about the *level* of any index should be
+   interpreted as 'representative of the chains we have', not 'national'.
+
+5. **Unit-field is messy.**  The flagged unit-homogeneity issues mostly
+   reflect the underlying scrape — many chain pages don't expose a
+   structured unit, so we end up with blank `unit` strings.  This is a
+   known data-quality issue, not a basket-design problem.  Resolving it
+   would involve enriching `unit` with `package_size_raw` parsing (which
+   the existing `karens_basket_enriched.csv` already does for a subset).
+
+# Reproducing this report
+
+```bash
+# 1. Build the QC table + candidate substitutes + perturbed baskets
+python analysis/sandbox/karens_basket_perturbation/build_qc.py
+
+# 2. Compute the basket-level inflation indices
+python analysis/sandbox/karens_basket_perturbation/build_indices.py
+
+# 3. Knit this Rmd
+Rscript -e "rmarkdown::render('analysis/karens_basket_perturbation.Rmd')"
+```
+
+The first two scripts read `data/pricing.parquet` and write CSV artifacts
+to `analysis/sandbox/karens_basket_perturbation/`.  This Rmd reads only
+those CSV artifacts and never touches the parquet directly, so it knits
+quickly.
+
+The three perturbed basket definitions are stored in
+`analysis/sandbox/karens_basket_perturbation/perturbed_baskets.csv` with
+columns `basket_name, label, patterns_json, source, n_years, n_chains,
+n_rows`.  This file is suitable for downstream integration into
+`baskets.py` if any of the alternative baskets are adopted as a
+permanent, app-visible basket.

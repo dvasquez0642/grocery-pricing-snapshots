@@ -1,0 +1,4 @@
+metric,value
+qaqc_file_available,yes
+flagged_files_total,499
+flagged_files_present_in_parquet,340

@@ -1,0 +1,10 @@
+metric,value
+report_year_window,2020-2025
+price_rows,1181102
+unique_chains,438
+unique_source_files,463
+non_sale_rows,990390
+sale_rows,190712
+rows_with_wayback_url,1181102
+rows_missing_wayback_url,0
+sources_with_all_6_years,83

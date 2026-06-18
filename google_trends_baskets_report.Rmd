@@ -1,0 +1,1292 @@
+---
+title: "Top Grocery Products by Google Trends"
+subtitle: "Top 3 products per basket item in Baskets.md"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  geo: "US"
+  time_window: "today+5-y"
+  request_pause_seconds: 8
+  max_retries: 6
+  retry_base_seconds: 15
+---
+
+```{r setup, include=FALSE}
+local_lib <- file.path(getwd(), "lib")
+dir.create(local_lib, showWarnings = FALSE, recursive = TRUE)
+.libPaths(c(normalizePath(local_lib, winslash = "/", mustWork = TRUE), .libPaths()))
+cache_dir <- file.path(getwd(), "trend_cache")
+dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
+
+required_packages <- c(
+  "dplyr",
+  "ggplot2",
+  "gtrendsR",
+  "knitr",
+  "purrr",
+  "readxl",
+  "readr",
+  "stringr",
+  "tibble",
+  "tidyr"
+)
+
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+
+if (length(missing_packages) > 0) {
+  stop(
+    paste(
+      "Install the required packages into the project lib folder before knitting:",
+      sprintf(
+        "install.packages(c(%s), lib = %s)",
+        paste(sprintf("'%s'", missing_packages), collapse = ", "),
+        shQuote(local_lib)
+      )
+    ),
+    call. = FALSE
+  )
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 4.5
+)
+```
+
+## Purpose
+
+This report ranks the top three products for each basket item listed in `Baskets.md` using Google Trends search interest in the United States over the last five years. It also extends the analysis to the marked supercategories in `Super Category - Food & Beverages (Disagg list).xlsx` by inferring representative product types, ranking those types within each supercategory, and then ranking branded products within the winning types.
+
+Google Trends works best with branded consumer products. For produce and other generic staples where brand-level search is weak, this report uses consumer-facing product phrases such as varieties, package forms, or retailer-style prepared items.
+
+## Method
+
+- Geography: `r params$geo`
+- Time window: `r params$time_window`
+- Ranking metric: average weekly Google Trends interest within each basket item
+- Tie break: median weekly Google Trends interest
+- Baseline pause between Google Trends requests: `r params$request_pause_seconds` seconds
+- Comparisons are made within each basket item, not across categories
+- Results are cached in `trend_cache/` so successful requests are reused on future knits
+- When a basket item has more than five candidate terms, the code uses an anchor term to normalize overlapping Google Trends requests
+- Workbook extension: rank three inferred product types within each marked supercategory, then rank branded products inside each winning type
+- Meal sorting for workbook product types is inferred from the product type rather than provided directly in the workbook
+
+```{r helpers}
+parse_basket_details <- function(path = "Baskets.md") {
+  lines <- readLines(path, warn = FALSE)
+  current_section <- NULL
+  details <- list()
+  detail_index <- 0L
+
+  for (line in lines) {
+    if (grepl("^\\*\\*.*\\*\\*$", line)) {
+      current_section <- sub("^\\*\\*(.*)\\*\\*$", "\\1", line)
+    } else if (!is.null(current_section) && grepl("^- ", line)) {
+      item_parts <- trimws(strsplit(sub("^-\\s*", "", line), "->", fixed = TRUE)[[1]])
+
+      if (length(item_parts) < 2) {
+        stop(sprintf("Basket line is missing a category: %s", line), call. = FALSE)
+      }
+
+      detail_index <- detail_index + 1L
+      details[[detail_index]] <- tibble::tibble(
+        order = detail_index,
+        section = current_section,
+        item = item_parts[[1]],
+        category = item_parts[[2]]
+      )
+    }
+  }
+
+  dplyr::bind_rows(details)
+}
+
+parse_baskets <- function(path = "Baskets.md") {
+  basket_details <- parse_basket_details(path)
+  split(
+    basket_details$item,
+    factor(basket_details$section, levels = unique(basket_details$section))
+  )
+}
+
+candidate_terms <- list(
+  "Oatmeal" = c("Quaker Oats", "McCann's Irish Oatmeal", "Bob's Red Mill oatmeal", "Nature's Path oatmeal", "Better Oats"),
+  "Cold cereal" = c("Cheerios", "Frosted Flakes", "Cinnamon Toast Crunch", "Captain Crunch", "Special K"),
+  "Sandwich bread" = c("Wonder Bread", "Sara Lee bread", "Nature's Own bread", "Pepperidge Farm bread", "Dave's Killer Bread"),
+  "Milk" = c("Fairlife milk", "Lactaid milk", "Horizon Organic milk", "Organic Valley milk", "Darigold milk"),
+  "Eggs" = c("Eggland's Best eggs", "Vital Farms eggs", "Nellie's eggs", "Happy Egg eggs", "Pete and Gerry's eggs"),
+  "Butter" = c("Kerrygold butter", "Land O Lakes butter", "Country Crock butter", "Challenge butter", "I Can't Believe It's Not Butter"),
+  "Jelly or jam" = c("Smucker's jam", "Welch's jelly", "Bonne Maman jam", "Polaner jelly", "Crofter's jam"),
+  "Coffee" = c("Folgers coffee", "Starbucks coffee", "Dunkin coffee", "Maxwell House coffee", "Peet's coffee"),
+  "Orange juice" = c("Tropicana orange juice", "Simply Orange", "Minute Maid orange juice", "Florida's Natural orange juice", "Natalie's orange juice"),
+  "Bananas" = c("Chiquita bananas", "Dole bananas", "organic bananas", "Cavendish bananas", "mini bananas"),
+  "Berries" = c("strawberries", "blueberries", "raspberries", "blackberries", "Driscoll's berries"),
+  "Sugar" = c("Domino sugar", "C&H sugar", "Florida Crystals sugar", "Imperial Sugar", "Domino brown sugar"),
+  "Dino nuggets" = c("Tyson dino nuggets", "Yummy Dino Buddies", "Perdue dinosaur nuggets", "Kidfresh chicken nuggets", "Applegate chicken nuggets"),
+  "Mac and cheese cups" = c("Kraft Easy Mac", "Velveeta shells cups", "Annie's mac cups", "Cheetos mac cups", "Goodles mac cups"),
+  "Applesauce cups" = c("Mott's applesauce cups", "Musselman's applesauce cups", "Tree Top applesauce cups", "GoGo squeeZ applesauce", "Kirkland applesauce pouches"),
+  "Crackers" = c("Goldfish crackers", "Ritz crackers", "Cheez-It crackers", "Triscuit crackers", "Wheat Thins"),
+  "Juice boxes" = c("Capri Sun", "Honest Kids juice", "Minute Maid juice box", "Juicy Juice", "Hi-C juice box"),
+  "Frozen peas" = c("Birds Eye peas", "Green Giant peas", "Cascadian Farm peas", "Pictsweet peas", "store brand frozen peas"),
+  "Granola bars" = c("Nature Valley granola bars", "KIND bars", "Chewy granola bars", "Clif bars", "RXBAR"),
+  "Peanut butter" = c("Jif peanut butter", "Skippy peanut butter", "Peter Pan peanut butter", "Justin's peanut butter", "Smucker's natural peanut butter"),
+  "String cheese" = c("Sargento string cheese", "Frigo string cheese", "Polly-O string cheese", "Kraft string cheese", "Horizon string cheese"),
+  "Chocolate milk" = c("Fairlife chocolate milk", "TruMoo chocolate milk", "Nesquik chocolate milk", "Horizon chocolate milk", "Promised Land chocolate milk"),
+  "Sports drink" = c("Gatorade", "Powerade", "BodyArmor", "Prime hydration", "Propel"),
+  "Rotisserie chicken" = c("Costco rotisserie chicken", "Sam's Club rotisserie chicken", "Walmart rotisserie chicken", "Whole Foods rotisserie chicken", "Kroger rotisserie chicken"),
+  "Frozen fish fillets" = c("Gorton's fish fillets", "Van de Kamp's fish fillets", "SeaPak fish fillets", "Trident fish fillets", "Mrs. Paul's fish fillets"),
+  "Rice" = c("Minute Rice", "Ben's Original rice", "Mahatma rice", "Carolina rice", "Rice-A-Roni"),
+  "Pasta" = c("Barilla pasta", "Ronzoni pasta", "De Cecco pasta", "Banza pasta", "Mueller's pasta"),
+  "Marinara sauce" = c("Rao's marinara", "Prego marinara", "Classico marinara", "Bertolli marinara", "Newman's Own marinara"),
+  "Salad greens" = c("baby spinach", "romaine hearts", "spring mix", "iceberg lettuce", "arugula"),
+  "Tomatoes" = c("cherry tomatoes", "grape tomatoes", "Roma tomatoes", "beefsteak tomatoes", "Campari tomatoes"),
+  "Onions" = c("yellow onions", "red onions", "sweet onions", "white onions", "green onions"),
+  "Mushrooms" = c("baby bella mushrooms", "white mushrooms", "shiitake mushrooms", "portobello mushrooms", "oyster mushrooms"),
+  "Frozen peas or corn" = c("Birds Eye corn", "Green Giant corn", "Birds Eye peas", "Green Giant peas", "Cascadian Farm corn"),
+  "Dinner rolls" = c("King's Hawaiian rolls", "Sister Schubert rolls", "Rhodes rolls", "Brown and Serve rolls", "Martin's potato rolls"),
+  "Shredded cheese" = c("Kraft shredded cheese", "Sargento shredded cheese", "Tillamook shredded cheese", "Cabot shredded cheese", "Lucerne shredded cheese"),
+  "Salad dressing" = c("Hidden Valley ranch", "Kraft Italian dressing", "Wish-Bone dressing", "Ken's dressing", "Olive Garden dressing"),
+  "Vegetable oil" = c("Wesson vegetable oil", "Crisco vegetable oil", "Mazola oil", "LouAna vegetable oil", "Great Value vegetable oil"),
+  "Ketchup or hot sauce" = c("Heinz ketchup", "Hunt's ketchup", "Frank's RedHot", "Tabasco", "Cholula"),
+  "Canned soup" = c("Campbell's soup", "Progresso soup", "Amy's soup", "Chunky soup", "Wolfgang Puck soup"),
+  "Frozen skillet meal" = c("Birds Eye Voila", "Hungry-Man frozen dinner", "Stouffer's skillet", "Healthy Choice frozen meal", "Marie Callender's frozen meal"),
+  "Ice cream" = c("Ben & Jerry's", "Haagen-Dazs", "Breyers ice cream", "Blue Bell ice cream", "Tillamook ice cream"),
+  "Potato chips" = c("Lay's potato chips", "Pringles", "Ruffles", "Kettle Brand chips", "Cape Cod chips"),
+  "Cheese cubes" = c("Cracker Barrel cheese cubes", "Sargento cheese cubes", "Tillamook cheese snacks", "Babybel cheese", "Cabot cheese cubes"),
+  "Apples" = c("Honeycrisp apples", "Gala apples", "Granny Smith apples", "Fuji apples", "Pink Lady apples"),
+  "Cookies" = c("Oreo cookies", "Chips Ahoy", "Milano cookies", "Nutter Butter", "Keebler cookies"),
+  "Soda or sparkling beverage" = c("Coca-Cola", "Pepsi", "Sprite", "LaCroix", "Spindrift")
+)
+
+candidate_terms <- c(
+  candidate_terms,
+  list(
+    "Flour" = c("Pillsbury Flour", "Gold Medal Flour", "King Arthur Flour"),
+    "Pancake mix" = c("Bisquick", "Kodiak Cakes pancake mix", "Krusteaz pancake mix", "Pearl Milling pancake mix"),
+    "Cornbread mix" = c("Jiffy cornbread mix", "Krusteaz cornbread mix", "Martha White cornbread mix"),
+    "Tea" = c("Lipton tea", "Pure Leaf tea", "Bigelow tea", "Celestial Seasonings tea"),
+    "Soda" = c("Coca-Cola", "Pepsi", "Sprite", "Dr Pepper", "Mountain Dew"),
+    "English muffins" = c("Thomas' English Muffins", "Bays English Muffins", "Wolferman's English Muffins"),
+    "Bagels" = c("Thomas' bagels", "Lender's bagels", "Dave's Killer Bread bagels"),
+    "Sliced cheese" = c("Kraft Singles", "Sargento sliced cheese", "Tillamook sliced cheese", "Cabot sliced cheese"),
+    "Cream cheese" = c("Philadelphia cream cheese", "Breakstone's cream cheese", "Temp Tee cream cheese"),
+    "K-Cups" = c("Starbucks K-Cup", "Dunkin K-Cup", "Green Mountain K-Cup", "McCafe K-Cup"),
+    "Cold brew" = c("Starbucks cold brew", "Stok cold brew", "Califia cold brew", "La Colombe cold brew"),
+    "Ketchup" = c("Heinz ketchup", "Hunt's ketchup", "Sir Kensington's ketchup"),
+    "Mayonnaise" = c("Hellmann's mayo", "Duke's mayo", "Kraft mayo", "Miracle Whip"),
+    "Hot sauce" = c("Frank's RedHot", "Tabasco", "Cholula", "Sriracha"),
+    "Graham crackers" = c("Honey Maid graham crackers", "Teddy Grahams", "Keebler graham crackers", "Annie's graham crackers"),
+    "Donuts" = c("Hostess Donettes", "Entenmann's donuts", "Krispy Kreme doughnuts", "Little Debbie donuts"),
+    "Brownies" = c("Cosmic Brownies", "Entenmann's brownies", "Two-Bite brownies"),
+    "Cage-free eggs" = c("Vital Farms eggs", "Nellie's eggs", "Pete and Gerry's eggs", "Happy Egg eggs"),
+    "Egg whites" = c("Egg Beaters", "AllWhites egg whites", "Bob Evans egg whites"),
+    "Applesauce" = c("Mott's applesauce", "Musselman's applesauce", "GoGo squeeZ applesauce", "Tree Top applesauce"),
+    "Mac and cheese" = c("Kraft Mac and Cheese", "Velveeta shells and cheese", "Annie's mac and cheese", "Goodles mac and cheese"),
+    "Frozen dinner" = c("Stouffer's frozen dinner", "Lean Cuisine", "Hungry-Man frozen dinner", "Healthy Choice frozen meal"),
+    "Instant ramen" = c("Maruchan ramen", "Top Ramen", "Cup Noodles", "Samyang ramen"),
+    "Yogurt" = c("Chobani yogurt", "Yoplait yogurt", "Dannon yogurt", "Oikos yogurt"),
+    "Almond butter" = c("Justin's almond butter", "Barney Butter", "MaraNatha almond butter", "Artisana almond butter"),
+    "Olive oil" = c("Bertolli olive oil", "Filippo Berio olive oil", "California Olive Ranch", "Pompeian olive oil"),
+    "Quinoa" = c("Ancient Harvest quinoa", "Bob's Red Mill quinoa", "Lundberg quinoa", "Arrowhead Mills quinoa"),
+    "Hamburger buns" = c("Ball Park buns", "Wonder buns", "Nature's Own buns", "Sara Lee buns"),
+    "Hot dog buns" = c("Ball Park hot dog buns", "Wonder hot dog buns", "Nature's Own hot dog buns", "Sara Lee hot dog buns"),
+    "Ranch dressing" = c("Hidden Valley ranch", "Ken's ranch", "Bolthouse Farms ranch", "Wish-Bone ranch"),
+    "Italian dressing" = c("Kraft Italian dressing", "Wish-Bone Italian dressing", "Ken's Italian dressing", "Newman's Own Italian dressing"),
+    "Caesar dressing" = c("Cardini's Caesar dressing", "Ken's Caesar dressing", "Kraft Caesar dressing", "Newman's Own Caesar dressing"),
+    "Tortilla chips" = c("Doritos", "Tostitos", "Santitas", "Late July tortilla chips"),
+    "Pretzels" = c("Snyder's of Hanover", "Rold Gold", "Dot's pretzels", "Utz pretzels"),
+    "Barbecue sauce" = c("Sweet Baby Ray's", "Kraft barbecue sauce", "Stubb's BBQ sauce", "KC Masterpiece"),
+    "Soy sauce" = c("Kikkoman soy sauce", "La Choy soy sauce", "Yamasa soy sauce", "San-J soy sauce"),
+    "Tuna" = c("StarKist tuna", "Bumble Bee tuna", "Chicken of the Sea tuna", "Safe Catch tuna"),
+    "Shrimp" = c("SeaPak shrimp", "Aqua Star shrimp", "Sea Best shrimp", "Gorton's shrimp"),
+    "Honey" = c("Nature Nate's honey", "Sue Bee honey", "Savannah Bee honey", "Manuka Health honey"),
+    "Stevia" = c("Truvia", "Stevia In The Raw", "Splenda Stevia", "SweetLeaf stevia")
+  )
+)
+
+inflation_notes <- c(
+  "Eggs" = "Egg prices drew sustained inflation attention because avian flu and supply disruptions pushed unusually sharp spikes in retail prices.",
+  "Butter" = "Butter has been part of broader dairy inflation coverage tied to milk supply, feed costs, and high demand for milk fat.",
+  "Coffee" = "Coffee has faced repeated price scrutiny as green coffee markets tightened and climate shocks raised input costs.",
+  "Orange juice" = "Orange juice has been a prominent inflation story because citrus greening and weather shocks constrained orange supply.",
+  "Sugar" = "Sugar prices have drawn scrutiny when weather and global commodity volatility pushed sweetener costs higher.",
+  "Crackers" = "Packaged snack categories such as crackers have appeared in inflation and shrinkflation reporting because branded pantry goods saw visible list-price increases.",
+  "Granola bars" = "Granola bars fit a broader packaged-snacks inflation pattern where brand pricing and pack-size changes drew consumer attention.",
+  "Peanut butter" = "Peanut butter has periodically appeared in grocery inflation coverage because branded spreads are easy for shoppers to notice when shelf prices jump.",
+  "Sports drink" = "Sports drinks have received scrutiny as branded beverage makers pushed through price increases while keeping demand relatively resilient.",
+  "Rice" = "Rice saw inflation attention when global supply restrictions and export news increased concern around staple pantry prices.",
+  "Pasta" = "Pasta has been part of staple-food inflation coverage tied to wheat costs, processing expenses, and branded packaged-food price hikes.",
+  "Marinara sauce" = "Jarred pasta sauce has appeared in packaged-food inflation discussions because tomatoes, packaging, and brand pricing all moved higher.",
+  "Salad dressing" = "Shelf-stable condiments and dressings have been part of packaged-food inflation scrutiny, especially where brand premiums widened.",
+  "Vegetable oil" = "Cooking oil prices drew attention during the recent inflation cycle as global vegetable-oil markets and processing costs rose.",
+  "Ketchup or hot sauce" = "Condiments have been part of inflation and shrinkflation scrutiny because shoppers can easily compare bottle prices and sizes over time.",
+  "Canned soup" = "Soup is a classic inflation watch item because major brands took multiple price increases in a category with strong consumer memory for shelf prices.",
+  "Frozen skillet meal" = "Frozen prepared meals fit the broader convenience-food inflation story, where labor, packaging, and protein costs all pushed prices upward.",
+  "Ice cream" = "Ice cream has faced scrutiny through both higher dairy costs and shrinkflation concerns in premium pint formats.",
+  "Potato chips" = "Potato chips have been a visible inflation and shrinkflation category because shoppers notice both bag size changes and higher per-bag prices.",
+  "Cookies" = "Cookies have been part of branded-snack inflation coverage because pack sizes and shelf prices changed in ways consumers could easily spot.",
+  "Soda or sparkling beverage" = "Soft drinks and sparkling beverages have drawn price scrutiny as major beverage companies used repeated list-price increases and smaller pack formats."
+)
+
+normalize_hits <- function(x) {
+  x <- as.character(x)
+  x <- dplyr::na_if(x, "")
+  x <- gsub("<1", "0.5", x, fixed = TRUE)
+  as.numeric(x)
+}
+
+normalize_time_window <- function(time_window) {
+  time_window <- trimws(time_window)
+
+  aliases <- c(
+    "today 5-y" = "today+5-y",
+    "last 5 years" = "today+5-y",
+    "5 years" = "today+5-y"
+  )
+
+  if (time_window %in% names(aliases)) {
+    return(unname(aliases[[time_window]]))
+  }
+
+  time_window
+}
+
+cache_key <- function(keywords, geo, time_window) {
+  key <- paste(c(sort(keywords), geo, time_window), collapse = "__")
+  key <- gsub("[^A-Za-z0-9]+", "_", key)
+  key <- gsub("_+", "_", key)
+  key <- gsub("^_|_$", "", key)
+  substr(key, 1, 180)
+}
+
+fetch_interest_once <- function(keywords, geo, time_window) {
+  time_window <- normalize_time_window(time_window)
+
+  result <- gtrendsR::gtrends(
+    keyword = keywords,
+    geo = geo,
+    time = time_window,
+    onlyInterest = TRUE
+  )$interest_over_time
+
+  if (!"isPartial" %in% names(result)) {
+    result$isPartial <- FALSE
+  }
+
+  result %>%
+    dplyr::mutate(
+      hits = normalize_hits(.data$hits),
+      isPartial = as.logical(.data$isPartial)
+    ) %>%
+    dplyr::filter(!.data$isPartial) %>%
+    dplyr::select(.data$date, .data$keyword, .data$hits)
+}
+
+fetch_interest <- function(keywords, geo, time_window, pause_seconds, max_retries, retry_base_seconds) {
+  time_window <- normalize_time_window(time_window)
+  cache_path <- file.path(cache_dir, paste0(cache_key(keywords, geo, time_window), ".rds"))
+
+  if (file.exists(cache_path)) {
+    return(readRDS(cache_path))
+  }
+
+  Sys.sleep(pause_seconds)
+
+  last_error <- NULL
+
+  for (attempt in seq_len(max_retries)) {
+    result <- tryCatch(
+      fetch_interest_once(keywords, geo = geo, time_window = time_window),
+      error = function(e) e
+    )
+
+    if (!inherits(result, "error")) {
+      saveRDS(result, cache_path)
+      return(result)
+    }
+
+    last_error <- result
+    error_message <- conditionMessage(result)
+    is_rate_limit <- grepl("status code:?\\s*429", error_message, ignore.case = TRUE)
+
+    if (!is_rate_limit || attempt == max_retries) {
+      break
+    }
+
+    wait_seconds <- retry_base_seconds * (2 ^ (attempt - 1)) + stats::runif(1, min = 0, max = 3)
+    message(
+      sprintf(
+        "Google Trends rate limit hit for %s. Waiting %.1f seconds before retry %d of %d.",
+        paste(keywords, collapse = ", "),
+        wait_seconds,
+        attempt + 1,
+        max_retries
+      )
+    )
+    Sys.sleep(wait_seconds)
+  }
+
+  stop(
+    paste(
+      "Google Trends request failed after retries.",
+      "Any completed requests are cached in 'trend_cache' so rerunning can continue from prior progress.",
+      conditionMessage(last_error)
+    ),
+    call. = FALSE
+  )
+}
+
+fetch_category_trends <- function(keywords, geo, time_window, pause_seconds, max_retries, retry_base_seconds) {
+  keywords <- unique(keywords)
+
+  if (length(keywords) <= 5) {
+    return(
+      fetch_interest(
+        keywords,
+        geo = geo,
+        time_window = time_window,
+        pause_seconds = pause_seconds,
+        max_retries = max_retries,
+        retry_base_seconds = retry_base_seconds
+      )
+    )
+  }
+
+  anchor <- keywords[[1]]
+  other_terms <- setdiff(keywords, anchor)
+  term_batches <- split(other_terms, ceiling(seq_along(other_terms) / 4))
+
+  base_batch <- fetch_interest(
+    c(anchor, term_batches[[1]]),
+    geo = geo,
+    time_window = time_window,
+    pause_seconds = pause_seconds,
+    max_retries = max_retries,
+    retry_base_seconds = retry_base_seconds
+  )
+  anchor_reference <- base_batch %>%
+    dplyr::filter(.data$keyword == anchor) %>%
+    dplyr::summarise(anchor_mean = mean(.data$hits, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::pull(anchor_mean)
+
+  combined <- base_batch
+
+  if (length(term_batches) > 1) {
+    for (batch_terms in term_batches[-1]) {
+      batch <- fetch_interest(
+        c(anchor, batch_terms),
+        geo = geo,
+        time_window = time_window,
+        pause_seconds = pause_seconds,
+        max_retries = max_retries,
+        retry_base_seconds = retry_base_seconds
+      )
+      anchor_batch <- batch %>%
+        dplyr::filter(.data$keyword == anchor) %>%
+        dplyr::summarise(anchor_mean = mean(.data$hits, na.rm = TRUE), .groups = "drop") %>%
+        dplyr::pull(anchor_mean)
+
+      scale_factor <- 1
+      if (is.finite(anchor_reference) && is.finite(anchor_batch) && anchor_reference > 0 && anchor_batch > 0) {
+        scale_factor <- anchor_reference / anchor_batch
+      }
+
+      scaled_batch <- batch %>%
+        dplyr::filter(.data$keyword != anchor) %>%
+        dplyr::mutate(hits = .data$hits * scale_factor)
+
+      combined <- dplyr::bind_rows(combined, scaled_batch)
+    }
+  }
+
+  combined
+}
+
+rank_keywords <- function(keywords, geo, time_window, pause_seconds, max_retries, retry_base_seconds) {
+  trend_data <- fetch_category_trends(
+    keywords,
+    geo = geo,
+    time_window = time_window,
+    pause_seconds = pause_seconds,
+    max_retries = max_retries,
+    retry_base_seconds = retry_base_seconds
+  )
+
+  summary_data <- trend_data %>%
+    dplyr::group_by(.data$keyword) %>%
+    dplyr::summarise(
+      avg_interest = mean(.data$hits, na.rm = TRUE),
+      median_interest = median(.data$hits, na.rm = TRUE),
+      peak_interest = max(.data$hits, na.rm = TRUE),
+      weeks_observed = sum(!is.na(.data$hits)),
+      .groups = "drop"
+    ) %>%
+    dplyr::filter(is.finite(.data$avg_interest)) %>%
+    dplyr::arrange(dplyr::desc(.data$avg_interest), dplyr::desc(.data$median_interest), dplyr::desc(.data$peak_interest)) %>%
+    dplyr::mutate(rank = dplyr::row_number())
+
+  if (nrow(summary_data) == 0) {
+    stop("Google Trends returned no usable data for the requested keyword set.", call. = FALSE)
+  }
+
+  list(
+    trends = trend_data,
+    summary = summary_data,
+    top_three = dplyr::slice_head(summary_data, n = 3)
+  )
+}
+
+rank_category <- function(item, geo, time_window, pause_seconds, max_retries, retry_base_seconds) {
+  keywords <- candidate_terms[[item]]
+
+  if (is.null(keywords)) {
+    stop(sprintf("No candidate terms configured for '%s'.", item), call. = FALSE)
+  }
+
+  rank_keywords(
+    keywords = keywords,
+    geo = geo,
+    time_window = time_window,
+    pause_seconds = pause_seconds,
+    max_retries = max_retries,
+    retry_base_seconds = retry_base_seconds
+  )
+}
+
+top_line <- function(top_three, noun = "products") {
+  terms <- top_three$keyword
+  singular_noun <- if (identical(noun, "products")) "product" else if (identical(noun, "product types")) "product type" else noun
+
+  if (length(terms) >= 3) {
+    return(sprintf("Top %s by average search interest: %s, %s, and %s.", noun, terms[[1]], terms[[2]], terms[[3]]))
+  }
+
+  if (length(terms) == 2) {
+    return(sprintf("Top %s by average search interest: %s and %s.", noun, terms[[1]], terms[[2]]))
+  }
+
+  sprintf("Top %s by average search interest: %s.", singular_noun, terms[[1]])
+}
+
+plot_category <- function(trend_data, top_terms, item) {
+  plot_data <- trend_data %>%
+    dplyr::mutate(series_group = ifelse(.data$keyword %in% top_terms, .data$keyword, "Other candidates"))
+
+  ggplot(plot_data, aes(x = .data$date, y = .data$hits, group = .data$keyword)) +
+    geom_line(
+      data = dplyr::filter(plot_data, .data$series_group == "Other candidates"),
+      color = "gray75",
+      linewidth = 0.5,
+      alpha = 0.8
+    ) +
+    geom_line(
+      data = dplyr::filter(plot_data, .data$series_group != "Other candidates"),
+      aes(color = .data$keyword),
+      linewidth = 0.9
+    ) +
+    scale_color_manual(values = c("#0b6e4f", "#c84c09", "#1f4e79")) +
+    labs(
+      title = paste("Google Trends candidates for", item),
+      x = NULL,
+      y = "Weekly search interest",
+      color = NULL
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      legend.position = "bottom",
+      plot.title.position = "plot"
+    )
+}
+
+basket_details <- parse_basket_details("Baskets.md")
+basket_sections <- split(
+  basket_details$item,
+  factor(basket_details$section, levels = unique(basket_details$section))
+)
+basket_categories <- split(
+  basket_details$item,
+  factor(basket_details$category, levels = unique(basket_details$category))
+)
+basket_category_counts <- basket_details %>%
+  dplyr::count(.data$category, name = "item_count", sort = TRUE)
+
+bls_component_weights <- purrr::imap_dfr(
+  list(
+    `2019` = c(
+      "Cereals and cereal products" = 0.308,
+      "Breakfast cereal" = 0.142,
+      "Other bakery products" = 0.214,
+      "Bread" = 0.200,
+      "Milk" = 0.218,
+      "Eggs" = 0.099,
+      "Butter and margarine" = 0.063,
+      "Other fats and oils including peanut butter" = 0.098,
+      "Coffee" = 0.169,
+      "Nonfrozen noncarbonated juices and drinks" = 0.382,
+      "Carbonated drinks" = 0.278,
+      "Apples" = 0.073,
+      "Bananas" = 0.074,
+      "Other fresh fruits" = 0.254,
+      "Frozen fruits and vegetables" = 0.086,
+      "Other processed fruits and vegetables including dried" = 0.052,
+      "Sugar and sugar substitutes" = 0.037,
+      "Chicken" = 0.273,
+      "Soups" = 0.089,
+      "Frozen and freeze dried prepared foods" = 0.259,
+      "Lettuce" = 0.068,
+      "Tomatoes" = 0.082,
+      "Other fresh vegetables" = 0.290,
+      "Cakes, cupcakes, and cookies" = 0.178,
+      "Cheese and related products" = 0.266,
+      "Processed fish and seafood" = 0.138,
+      "Rice, pasta, cornmeal" = 0.124,
+      "Spices, seasonings, condiments, sauces" = 0.290,
+      "Fresh biscuits, rolls, muffins" = 0.101,
+      "Salad dressing" = 0.051,
+      "Ice cream and related products" = 0.111,
+      "Snacks" = 0.340
+    ),
+    `2020` = c(
+      "Cereals and cereal products" = 0.308,
+      "Breakfast cereal" = 0.142,
+      "Other bakery products" = 0.214,
+      "Bread" = 0.200,
+      "Milk" = 0.218,
+      "Eggs" = 0.099,
+      "Butter and margarine" = 0.063,
+      "Other fats and oils including peanut butter" = 0.098,
+      "Coffee" = 0.169,
+      "Nonfrozen noncarbonated juices and drinks" = 0.382,
+      "Carbonated drinks" = 0.278,
+      "Apples" = 0.073,
+      "Bananas" = 0.074,
+      "Other fresh fruits" = 0.254,
+      "Frozen fruits and vegetables" = 0.086,
+      "Other processed fruits and vegetables including dried" = 0.052,
+      "Sugar and sugar substitutes" = 0.037,
+      "Chicken" = 0.273,
+      "Soups" = 0.089,
+      "Frozen and freeze dried prepared foods" = 0.259,
+      "Lettuce" = 0.068,
+      "Tomatoes" = 0.082,
+      "Other fresh vegetables" = 0.290,
+      "Cakes, cupcakes, and cookies" = 0.178,
+      "Cheese and related products" = 0.266,
+      "Processed fish and seafood" = 0.138,
+      "Rice, pasta, cornmeal" = 0.124,
+      "Spices, seasonings, condiments, sauces" = 0.290,
+      "Fresh biscuits, rolls, muffins" = 0.101,
+      "Salad dressing" = 0.051,
+      "Ice cream and related products" = 0.111,
+      "Snacks" = 0.340
+    ),
+    `2021` = c(
+      "Cereals and cereal products" = 0.332,
+      "Breakfast cereal" = 0.143,
+      "Other bakery products" = 0.223,
+      "Bread" = 0.199,
+      "Milk" = 0.194,
+      "Eggs" = 0.109,
+      "Butter and margarine" = 0.066,
+      "Other fats and oils including peanut butter" = 0.108,
+      "Coffee" = 0.174,
+      "Nonfrozen noncarbonated juices and drinks" = 0.378,
+      "Carbonated drinks" = 0.277,
+      "Apples" = 0.076,
+      "Bananas" = 0.081,
+      "Other fresh fruits" = 0.266,
+      "Frozen fruits and vegetables" = 0.098,
+      "Other processed fruits and vegetables including dried" = 0.063,
+      "Sugar and sugar substitutes" = 0.040,
+      "Chicken" = 0.281,
+      "Soups" = 0.094,
+      "Frozen and freeze dried prepared foods" = 0.263,
+      "Lettuce" = 0.062,
+      "Tomatoes" = 0.084,
+      "Other fresh vegetables" = 0.283,
+      "Cakes, cupcakes, and cookies" = 0.171,
+      "Cheese and related products" = 0.249,
+      "Processed fish and seafood" = 0.142,
+      "Rice, pasta, cornmeal" = 0.138,
+      "Spices, seasonings, condiments, sauces" = 0.317,
+      "Fresh biscuits, rolls, muffins" = 0.106,
+      "Salad dressing" = 0.055,
+      "Ice cream and related products" = 0.113,
+      "Snacks" = 0.359
+    ),
+    `2022` = c(
+      "Cereals and cereal products" = 0.365,
+      "Breakfast cereal" = 0.146,
+      "Other bakery products" = 0.249,
+      "Bread" = 0.226,
+      "Milk" = 0.204,
+      "Eggs" = 0.167,
+      "Butter and margarine" = 0.086,
+      "Other fats and oils including peanut butter" = 0.114,
+      "Coffee" = 0.200,
+      "Nonfrozen noncarbonated juices and drinks" = 0.413,
+      "Carbonated drinks" = 0.307,
+      "Apples" = 0.083,
+      "Bananas" = 0.091,
+      "Other fresh fruits" = 0.247,
+      "Frozen fruits and vegetables" = 0.108,
+      "Other processed fruits and vegetables including dried" = 0.076,
+      "Sugar and sugar substitutes" = 0.040,
+      "Chicken" = 0.283,
+      "Soups" = 0.104,
+      "Frozen and freeze dried prepared foods" = 0.275,
+      "Lettuce" = 0.085,
+      "Tomatoes" = 0.092,
+      "Other fresh vegetables" = 0.280,
+      "Cakes, cupcakes, and cookies" = 0.207,
+      "Cheese and related products" = 0.253,
+      "Processed fish and seafood" = 0.150,
+      "Rice, pasta, cornmeal" = 0.159,
+      "Spices, seasonings, condiments, sauces" = 0.353,
+      "Fresh biscuits, rolls, muffins" = 0.118,
+      "Salad dressing" = 0.061,
+      "Ice cream and related products" = 0.123,
+      "Snacks" = 0.376
+    ),
+    `2023` = c(
+      "Cereals and cereal products" = 0.314,
+      "Breakfast cereal" = 0.123,
+      "Other bakery products" = 0.241,
+      "Bread" = 0.203,
+      "Milk" = 0.178,
+      "Eggs" = 0.119,
+      "Butter and margarine" = 0.076,
+      "Other fats and oils including peanut butter" = 0.116,
+      "Coffee" = 0.186,
+      "Nonfrozen noncarbonated juices and drinks" = 0.397,
+      "Carbonated drinks" = 0.324,
+      "Apples" = 0.070,
+      "Bananas" = 0.085,
+      "Other fresh fruits" = 0.258,
+      "Frozen fruits and vegetables" = 0.105,
+      "Other processed fruits and vegetables including dried" = 0.068,
+      "Sugar and sugar substitutes" = 0.042,
+      "Chicken" = 0.254,
+      "Soups" = 0.095,
+      "Frozen and freeze dried prepared foods" = 0.261,
+      "Lettuce" = 0.064,
+      "Tomatoes" = 0.082,
+      "Other fresh vegetables" = 0.276,
+      "Cakes, cupcakes, and cookies" = 0.191,
+      "Cheese and related products" = 0.236,
+      "Processed fish and seafood" = 0.135,
+      "Rice, pasta, cornmeal" = 0.139,
+      "Spices, seasonings, condiments, sauces" = 0.322,
+      "Fresh biscuits, rolls, muffins" = 0.117,
+      "Salad dressing" = 0.060,
+      "Ice cream and related products" = 0.111,
+      "Snacks" = 0.349
+    ),
+    `2024` = c(
+      "Cereals and cereal products" = 0.341,
+      "Breakfast cereal" = 0.148,
+      "Other bakery products" = 0.279,
+      "Bread" = 0.142,
+      "Milk" = 0.200,
+      "Eggs" = 0.172,
+      "Butter and margarine" = 0.055,
+      "Other fats and oils including peanut butter" = 0.129,
+      "Coffee" = 0.134,
+      "Nonfrozen noncarbonated juices and drinks" = 0.287,
+      "Carbonated drinks" = 0.341,
+      "Apples" = 0.080,
+      "Bananas" = 0.109,
+      "Other fresh fruits" = 0.310,
+      "Frozen fruits and vegetables" = 0.067,
+      "Other processed fruits and vegetables including dried" = 0.065,
+      "Sugar and sugar substitutes" = 0.028,
+      "Chicken" = 0.216,
+      "Soups" = 0.105,
+      "Frozen and freeze dried prepared foods" = 0.279,
+      "Lettuce" = 0.071,
+      "Tomatoes" = 0.094,
+      "Other fresh vegetables" = 0.309,
+      "Cakes, cupcakes, and cookies" = 0.213,
+      "Cheese and related products" = 0.255,
+      "Processed fish and seafood" = 0.102,
+      "Rice, pasta, cornmeal" = 0.164,
+      "Spices, seasonings, condiments, sauces" = 0.383,
+      "Fresh biscuits, rolls, muffins" = 0.135,
+      "Salad dressing" = 0.066,
+      "Ice cream and related products" = 0.132,
+      "Snacks" = 0.365
+    ),
+    `2025` = c(
+      "Cereals and cereal products" = 0.315,
+      "Breakfast cereal" = 0.136,
+      "Other bakery products" = 0.217,
+      "Bread" = 0.175,
+      "Milk" = 0.190,
+      "Eggs" = 0.133,
+      "Butter and margarine" = 0.066,
+      "Other fats and oils including peanut butter" = 0.110,
+      "Coffee" = 0.221,
+      "Nonfrozen noncarbonated juices and drinks" = 0.346,
+      "Carbonated drinks" = 0.324,
+      "Apples" = 0.073,
+      "Bananas" = 0.060,
+      "Other fresh fruits" = 0.322,
+      "Frozen fruits and vegetables" = 0.084,
+      "Other processed fruits and vegetables including dried" = 0.082,
+      "Sugar and sugar substitutes" = 0.032,
+      "Chicken" = 0.291,
+      "Soups" = 0.085,
+      "Frozen and freeze dried prepared foods" = 0.305,
+      "Lettuce" = 0.044,
+      "Tomatoes" = 0.063,
+      "Other fresh vegetables" = 0.305,
+      "Cakes, cupcakes, and cookies" = 0.210,
+      "Cheese and related products" = 0.261,
+      "Processed fish and seafood" = 0.149,
+      "Rice, pasta, cornmeal" = 0.141,
+      "Spices, seasonings, condiments, sauces" = 0.317,
+      "Fresh biscuits, rolls, muffins" = 0.120,
+      "Salad dressing" = 0.055,
+      "Ice cream and related products" = 0.115,
+      "Snacks" = 0.372
+    )
+  ),
+  ~tibble::enframe(.x, name = "component", value = "weight") %>%
+    dplyr::mutate(year = as.integer(.y), .before = 1)
+)
+
+basket_category_weight_map <- purrr::imap_dfr(
+  list(
+    "CEREAL & GRANOLA" = c(
+      "Cereals and cereal products" = 1,
+      "Breakfast cereal" = 1,
+      "Other bakery products" = 0.5
+    ),
+    "BREAD" = c("Bread" = 1),
+    "MILK PRODUCTS" = c("Milk" = 1),
+    "EGGS" = c("Eggs" = 1),
+    "OILS/BUTTER/MARGARINE SPREADS/SUBSTITUTES" = c(
+      "Butter and margarine" = 1,
+      "Other fats and oils including peanut butter" = 0.5
+    ),
+    "NUT BUTTERS/JAM/JELLIES" = c(
+      "Other fats and oils including peanut butter" = 0.5
+    ),
+    "COFFEE" = c("Coffee" = 1),
+    "BEVERAGES" = c(
+      "Nonfrozen noncarbonated juices and drinks" = 1,
+      "Carbonated drinks" = 1
+    ),
+    "FRUIT" = c(
+      "Apples" = 1,
+      "Bananas" = 1,
+      "Other fresh fruits" = 1,
+      "Other processed fruits and vegetables including dried" = 1
+    ),
+    "SUGAR & SWEETENERS" = c("Sugar and sugar substitutes" = 1),
+    "PREPARED FOODS" = c(
+      "Chicken" = 1,
+      "Soups" = 1,
+      "Frozen and freeze dried prepared foods" = 0.5
+    ),
+    "MEAL COMBOS" = c(
+      "Frozen and freeze dried prepared foods" = 0.5
+    ),
+    "VEGETABLES" = c(
+      "Lettuce" = 1,
+      "Tomatoes" = 1,
+      "Other fresh vegetables" = 1,
+      "Frozen fruits and vegetables" = 1
+    ),
+    "COOKIES & CRACKERS" = c(
+      "Cakes, cupcakes, and cookies" = 1,
+      "Other bakery products" = 0.5
+    ),
+    "CHEESE" = c("Cheese and related products" = 1),
+    "SEAFOOD" = c("Processed fish and seafood" = 1),
+    "PASTA/RICE/GRAINS" = c("Rice, pasta, cornmeal" = 1),
+    "SAUCE/GRAVY/MARINADE" = c("Spices, seasonings, condiments, sauces" = 0.5),
+    "ROLLS & BUNS" = c("Fresh biscuits, rolls, muffins" = 1),
+    "SALAD DRESSING" = c("Salad dressing" = 1),
+    "CONDIMENTS" = c("Spices, seasonings, condiments, sauces" = 0.5),
+    "DESSERTS/SWEET GOODS" = c("Ice cream and related products" = 1),
+    "SALTY SNACKS" = c("Snacks" = 1)
+  ),
+  ~tibble::enframe(.x, name = "component", value = "allocation") %>%
+    dplyr::mutate(category = .y, .before = 1)
+)
+
+category_cpi_weights <- basket_category_weight_map %>%
+  dplyr::left_join(bls_component_weights, by = "component") %>%
+  dplyr::mutate(cpi_share = .data$allocation * .data$weight) %>%
+  dplyr::group_by(.data$year, .data$category) %>%
+  dplyr::summarise(cpi_share = sum(.data$cpi_share), .groups = "drop")
+
+food_at_home_weights <- tibble::tribble(
+  ~year, ~food_at_home_share,
+  2019L, 7.772,
+  2020L, 7.772,
+  2021L, 8.165,
+  2022L, 8.728,
+  2023L, 8.167,
+  2024L, 8.043,
+  2025L, 8.325
+)
+
+category_cpi_weights <- category_cpi_weights %>%
+  dplyr::left_join(food_at_home_weights, by = "year") %>%
+  dplyr::mutate(food_at_home_pct = 100 * .data$cpi_share / .data$food_at_home_share)
+
+category_plot_order <- category_cpi_weights %>%
+  dplyr::filter(.data$year == max(.data$year)) %>%
+  dplyr::arrange(dplyr::desc(.data$food_at_home_pct), .data$category) %>%
+  dplyr::pull(.data$category)
+
+all_items <- unique(unlist(basket_sections, use.names = FALSE))
+missing_items <- setdiff(all_items, names(candidate_terms))
+
+if (length(missing_items) > 0) {
+  stop(
+    paste("Add candidate terms for:", paste(missing_items, collapse = ", ")),
+    call. = FALSE
+  )
+}
+
+workbook_categories <- readxl::read_xlsx("Super Category - Food & Beverages (Disagg list).xlsx") %>%
+  dplyr::rename(
+    supercategory = `Super Category (Food & Beverages)`,
+    in_karen = `Karen's Basket`,
+    basket_examples = `Karen's Basket Item(s)`
+  ) %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), ~ trimws(as.character(.x)))) %>%
+  dplyr::filter(toupper(.data$in_karen) == "X") %>%
+  dplyr::select(.data$supercategory, .data$basket_examples)
+
+supercategory_type_candidates <- list(
+  "BAKING STAPLES" = tibble::tribble(
+    ~product_type, ~meal,
+    "Flour", "Breakfast",
+    "Pancake mix", "Breakfast",
+    "Cornbread mix", "Dinner"
+  ),
+  "BEVERAGES" = tibble::tribble(
+    ~product_type, ~meal,
+    "Orange juice", "Breakfast",
+    "Tea", "Lunch",
+    "Soda", "Snacks"
+  ),
+  "BREAD" = tibble::tribble(
+    ~product_type, ~meal,
+    "Sandwich bread", "Lunch",
+    "English muffins", "Breakfast",
+    "Bagels", "Breakfast"
+  ),
+  "CEREAL & GRANOLA" = tibble::tribble(
+    ~product_type, ~meal,
+    "Oatmeal", "Breakfast",
+    "Cold cereal", "Breakfast",
+    "Granola bars", "Snacks"
+  ),
+  "CHEESE" = tibble::tribble(
+    ~product_type, ~meal,
+    "Sliced cheese", "Lunch",
+    "Cream cheese", "Breakfast",
+    "Shredded cheese", "Dinner"
+  ),
+  "COFFEE" = tibble::tribble(
+    ~product_type, ~meal,
+    "Coffee", "Breakfast",
+    "K-Cups", "Breakfast",
+    "Cold brew", "Snacks"
+  ),
+  "CONDIMENTS" = tibble::tribble(
+    ~product_type, ~meal,
+    "Ketchup", "Lunch",
+    "Mayonnaise", "Lunch",
+    "Hot sauce", "Dinner"
+  ),
+  "COOKIES & CRACKERS" = tibble::tribble(
+    ~product_type, ~meal,
+    "Crackers", "Lunch",
+    "Cookies", "Snacks",
+    "Graham crackers", "Snacks"
+  ),
+  "DESSERTS/SWEET GOODS" = tibble::tribble(
+    ~product_type, ~meal,
+    "Ice cream", "Snacks",
+    "Donuts", "Breakfast",
+    "Brownies", "Snacks"
+  ),
+  "EGGS" = tibble::tribble(
+    ~product_type, ~meal,
+    "Eggs", "Breakfast",
+    "Cage-free eggs", "Breakfast",
+    "Egg whites", "Breakfast"
+  ),
+  "FRUIT" = tibble::tribble(
+    ~product_type, ~meal,
+    "Apples", "Snacks",
+    "Bananas", "Breakfast",
+    "Applesauce", "Lunch"
+  ),
+  "MEAL COMBOS" = tibble::tribble(
+    ~product_type, ~meal,
+    "Mac and cheese", "Lunch",
+    "Frozen dinner", "Dinner",
+    "Instant ramen", "Lunch"
+  ),
+  "MILK PRODUCTS" = tibble::tribble(
+    ~product_type, ~meal,
+    "Milk", "Breakfast",
+    "Yogurt", "Breakfast",
+    "Chocolate milk", "Snacks"
+  ),
+  "NUT BUTTERS/JAM/JELLIES" = tibble::tribble(
+    ~product_type, ~meal,
+    "Peanut butter", "Breakfast",
+    "Jelly or jam", "Breakfast",
+    "Almond butter", "Snacks"
+  ),
+  "OILS/BUTTER/MARGARINE SPREADS/SUBSTITUTES" = tibble::tribble(
+    ~product_type, ~meal,
+    "Butter", "Breakfast",
+    "Vegetable oil", "Dinner",
+    "Olive oil", "Dinner"
+  ),
+  "PASTA/RICE/GRAINS" = tibble::tribble(
+    ~product_type, ~meal,
+    "Pasta", "Dinner",
+    "Rice", "Dinner",
+    "Quinoa", "Dinner"
+  ),
+  "PREPARED FOODS" = tibble::tribble(
+    ~product_type, ~meal,
+    "Canned soup", "Lunch",
+    "Rotisserie chicken", "Dinner",
+    "Frozen skillet meal", "Dinner"
+  ),
+  "ROLLS & BUNS" = tibble::tribble(
+    ~product_type, ~meal,
+    "Hamburger buns", "Lunch",
+    "Dinner rolls", "Dinner",
+    "Hot dog buns", "Lunch"
+  ),
+  "SALAD DRESSING" = tibble::tribble(
+    ~product_type, ~meal,
+    "Ranch dressing", "Dinner",
+    "Italian dressing", "Dinner",
+    "Caesar dressing", "Dinner"
+  ),
+  "SALTY SNACKS" = tibble::tribble(
+    ~product_type, ~meal,
+    "Potato chips", "Snacks",
+    "Tortilla chips", "Snacks",
+    "Pretzels", "Snacks"
+  ),
+  "SAUCE/GRAVY/MARINADE" = tibble::tribble(
+    ~product_type, ~meal,
+    "Marinara sauce", "Dinner",
+    "Barbecue sauce", "Dinner",
+    "Soy sauce", "Dinner"
+  ),
+  "SEAFOOD" = tibble::tribble(
+    ~product_type, ~meal,
+    "Tuna", "Lunch",
+    "Frozen fish fillets", "Dinner",
+    "Shrimp", "Dinner"
+  ),
+  "SUGAR & SWEETENERS" = tibble::tribble(
+    ~product_type, ~meal,
+    "Sugar", "Breakfast",
+    "Honey", "Breakfast",
+    "Stevia", "Breakfast"
+  ),
+  "VEGETABLES" = tibble::tribble(
+    ~product_type, ~meal,
+    "Salad greens", "Lunch",
+    "Tomatoes", "Dinner",
+    "Frozen peas or corn", "Dinner"
+  )
+)
+
+missing_supercategories <- setdiff(workbook_categories$supercategory, names(supercategory_type_candidates))
+
+if (length(missing_supercategories) > 0) {
+  stop(
+    paste("Add supercategory product-type mappings for:", paste(missing_supercategories, collapse = ", ")),
+    call. = FALSE
+  )
+}
+
+product_type_details <- purrr::imap_dfr(
+  supercategory_type_candidates,
+  ~ dplyr::mutate(.x, supercategory = .y, .before = 1)
+) %>%
+  dplyr::left_join(workbook_categories, by = "supercategory")
+
+missing_product_type_terms <- setdiff(unique(product_type_details$product_type), names(candidate_terms))
+
+if (length(missing_product_type_terms) > 0) {
+  stop(
+    paste("Add branded product candidates for:", paste(missing_product_type_terms, collapse = ", ")),
+    call. = FALSE
+  )
+}
+
+meal_order <- c("Breakfast", "Lunch", "Dinner", "Snacks")
+```
+
+## Top Products by Type
+
+This section combines the original basket item types from `Baskets.md` with the workbook-derived product types and shows the top branded products for each type in one place.
+
+```{r top-products-by-type, results='asis', fig.show='asis'}
+category_cache <- list()
+supercategory_rank_cache <- list()
+all_type_winners <- list()
+winner_index <- 0L
+
+for (supercategory_name in workbook_categories$supercategory) {
+  type_config <- supercategory_type_candidates[[supercategory_name]]
+
+  supercategory_rank_cache[[supercategory_name]] <- rank_keywords(
+    keywords = type_config$product_type,
+    geo = params$geo,
+    time_window = params$time_window,
+    pause_seconds = params$request_pause_seconds,
+    max_retries = params$max_retries,
+    retry_base_seconds = params$retry_base_seconds
+  )
+}
+
+workbook_meal_rows <- purrr::map_dfr(workbook_categories$supercategory, function(supercategory_name) {
+  type_config <- supercategory_type_candidates[[supercategory_name]]
+  type_result <- supercategory_rank_cache[[supercategory_name]]
+
+  type_result$summary %>%
+    dplyr::left_join(type_config, by = c("keyword" = "product_type")) %>%
+    dplyr::slice_head(n = 3) %>%
+    dplyr::mutate(supercategory = supercategory_name, .before = 1)
+})
+
+display_sections <- c("Breakfast", "Lunch", "Child Specific", "Exercise Snacks", "Dinner", "Snacks")
+
+for (section_name in display_sections) {
+  section_basket_items <- basket_sections[[section_name]]
+  if (is.null(section_basket_items)) {
+    section_basket_items <- character()
+  }
+
+  section_workbook_rows <- workbook_meal_rows %>%
+    dplyr::filter(.data$meal == section_name)
+
+  if (length(section_basket_items) == 0 && nrow(section_workbook_rows) == 0) {
+    next
+  }
+
+  cat("\n\n### ", section_name, "\n\n", sep = "")
+
+  for (item in section_basket_items) {
+    if (is.null(category_cache[[item]])) {
+      category_cache[[item]] <- rank_category(
+        item,
+        geo = params$geo,
+        time_window = params$time_window,
+        pause_seconds = params$request_pause_seconds,
+        max_retries = params$max_retries,
+        retry_base_seconds = params$retry_base_seconds
+      )
+    }
+
+    category_result <- category_cache[[item]]
+    top_three <- category_result$top_three
+
+    cat("\n\n#### ", item, "\n\n", sep = "")
+    cat(
+      "Type source: Original basket item\n\nCandidate terms: ",
+      paste(candidate_terms[[item]], collapse = ", "),
+      "\n\n",
+      sep = ""
+    )
+
+    cat(top_line(top_three), "\n\n")
+
+    if (item %in% names(inflation_notes)) {
+      cat("Inflation note: ", inflation_notes[[item]], "\n\n", sep = "")
+    }
+
+    table_data <- top_three %>%
+      dplyr::transmute(
+        Rank = .data$rank,
+        Product = .data$keyword,
+        `Average weekly interest` = round(.data$avg_interest, 1),
+        `Median weekly interest` = round(.data$median_interest, 1),
+        `Peak weekly interest` = round(.data$peak_interest, 1)
+      )
+
+    winner_index <- winner_index + 1L
+    all_type_winners[[winner_index]] <- tibble::tibble(
+      meal = section_name,
+      supercategory = basket_details %>%
+        dplyr::filter(.data$item == item) %>%
+        dplyr::slice_head(n = 1) %>%
+        dplyr::pull(.data$category),
+      product_type = item,
+      top_product = top_three$keyword[[1]],
+      top_product_source_avg_interest = top_three$avg_interest[[1]]
+    )
+
+    cat(knitr::kable(table_data, align = c("c", "l", "r", "r", "r")), sep = "\n")
+    cat("\n\n")
+    print(plot_category(category_result$trends, top_three$keyword, item))
+  }
+
+  for (row_index in seq_len(nrow(section_workbook_rows))) {
+    supercategory_name <- section_workbook_rows$supercategory[[row_index]]
+    product_type <- section_workbook_rows$keyword[[row_index]]
+    basket_examples <- workbook_categories$basket_examples[[match(supercategory_name, workbook_categories$supercategory)]]
+
+    if (is.null(category_cache[[product_type]])) {
+      category_cache[[product_type]] <- rank_category(
+        product_type,
+        geo = params$geo,
+        time_window = params$time_window,
+        pause_seconds = params$request_pause_seconds,
+        max_retries = params$max_retries,
+        retry_base_seconds = params$retry_base_seconds
+      )
+    }
+
+    product_result <- category_cache[[product_type]]
+    product_table <- product_result$top_three %>%
+      dplyr::transmute(
+        Rank = .data$rank,
+        Product = .data$keyword,
+        `Average weekly interest` = round(.data$avg_interest, 1),
+        `Median weekly interest` = round(.data$median_interest, 1),
+        `Peak weekly interest` = round(.data$peak_interest, 1)
+      )
+
+    winner_index <- winner_index + 1L
+    all_type_winners[[winner_index]] <- tibble::tibble(
+      meal = section_name,
+      supercategory = supercategory_name,
+      product_type = product_type,
+      top_product = product_result$top_three$keyword[[1]],
+      top_product_source_avg_interest = product_result$top_three$avg_interest[[1]]
+    )
+
+    cat("\n\n#### ", product_type, "\n\n", sep = "")
+    cat("Type source: Workbook-inferred product type\n\n")
+    cat("Supercategory: `", supercategory_name, "`\n\n", sep = "")
+    cat("Karen's Basket examples: ", basket_examples, "\n\n", sep = "")
+    cat(
+      "Product type rank within supercategory: #",
+      section_workbook_rows$rank[[row_index]],
+      " with average weekly interest ",
+      round(section_workbook_rows$avg_interest[[row_index]], 1),
+      ".\n\n",
+      sep = ""
+    )
+    cat(top_line(product_result$top_three), "\n\n")
+    cat(knitr::kable(product_table, align = c("c", "l", "r", "r", "r")), sep = "\n")
+    cat("\n\n")
+    print(plot_category(product_result$trends, product_result$top_three$keyword, product_type))
+  }
+}
+
+all_type_winners <- dplyr::bind_rows(all_type_winners)
+```
+
+## Workbook Supercategory Product Types
+
+This section uses the marked supercategories in `Super Category - Food & Beverages (Disagg list).xlsx`, infers three representative product types for each one, and ranks those types in a single Google Trends comparison within the supercategory.
+
+```{r workbook-supercategory-types, results='asis', fig.show='asis'}
+for (row_index in seq_len(nrow(workbook_categories))) {
+  supercategory_name <- workbook_categories$supercategory[[row_index]]
+  basket_examples <- workbook_categories$basket_examples[[row_index]]
+  type_config <- supercategory_type_candidates[[supercategory_name]]
+
+  type_result <- supercategory_rank_cache[[supercategory_name]]
+  type_table <- type_result$summary %>%
+    dplyr::left_join(type_config, by = c("keyword" = "product_type")) %>%
+    dplyr::slice_head(n = 3) %>%
+    dplyr::transmute(
+      Rank = .data$rank,
+      `Product type` = .data$keyword,
+      Meal = .data$meal,
+      `Average weekly interest` = round(.data$avg_interest, 1),
+      `Median weekly interest` = round(.data$median_interest, 1),
+      `Peak weekly interest` = round(.data$peak_interest, 1)
+    )
+
+  cat("\n\n### ", supercategory_name, "\n\n", sep = "")
+  cat("Karen's Basket examples: ", basket_examples, "\n\n", sep = "")
+  cat(top_line(type_result$top_three, noun = "product types"), "\n\n")
+  cat(knitr::kable(type_table, align = c("c", "l", "l", "r", "r", "r")), sep = "\n")
+  cat("\n\n")
+  print(plot_category(type_result$trends, type_result$top_three$keyword, paste(supercategory_name, "product types")))
+}
+```
+
+## Aggregate Product Winners
+
+This section reranks the first-place branded product from every type shown in `Top Products by Type` in one combined Google Trends comparison so the aggregate ranks are comparable on a shared scale.
+
+```{r workbook-aggregate-product-winners, results='asis'}
+workbook_aggregate_comparison <- rank_keywords(
+  keywords = unique(all_type_winners$top_product),
+  geo = params$geo,
+  time_window = params$time_window,
+  pause_seconds = params$request_pause_seconds,
+  max_retries = params$max_retries,
+  retry_base_seconds = params$retry_base_seconds
+)
+
+workbook_aggregate_table <- all_type_winners %>%
+  dplyr::left_join(
+    workbook_aggregate_comparison$summary %>%
+      dplyr::transmute(
+        top_product = .data$keyword,
+        `Aggregate rank` = .data$rank,
+        `Aggregate average weekly interest` = round(.data$avg_interest, 1),
+        `Aggregate median weekly interest` = round(.data$median_interest, 1),
+        `Aggregate peak weekly interest` = round(.data$peak_interest, 1)
+      ),
+    by = "top_product"
+  ) %>%
+  dplyr::transmute(
+    Meal = .data$meal,
+    Supercategory = .data$supercategory,
+    `Product type` = .data$product_type,
+    `Top product` = .data$top_product,
+    `Aggregate rank` = .data$`Aggregate rank`,
+    `Aggregate average weekly interest` = .data$`Aggregate average weekly interest`,
+    `Aggregate median weekly interest` = .data$`Aggregate median weekly interest`,
+    `Aggregate peak weekly interest` = .data$`Aggregate peak weekly interest`
+  ) %>%
+  dplyr::arrange(.data$`Aggregate rank`, .data$Meal, .data$Supercategory, .data$`Product type`)
+
+cat(knitr::kable(workbook_aggregate_table, align = c("l", "l", "l", "l", "r", "r", "r", "r")), sep = "\n")
+```
+
+## Notes And Caveats
+
+- Google Trends values are normalized within each request, so the report only compares products inside the same basket item.
+- Candidate terms are curated to match consumer-facing products. You can edit the `candidate_terms` object to test different brands or product phrases.
+- Produce-heavy items use varieties or common product phrases because brand-level search demand is often too sparse or unstable.
+- If Google Trends throttles requests during knitting, the report now retries with exponential backoff and stores successful pulls in `trend_cache/`.
+- If rate limiting still persists, rerun later; cached requests will be reused and the report will continue filling in what is still missing.
+- The workbook extension uses the supercategories marked with `X` in `Super Category - Food & Beverages (Disagg list).xlsx`, infers three representative product types per supercategory, and then ranks branded products within each winning type.
+- Meal sorting is inferred rather than sourced from the workbook itself, so categories such as beverages or fruit may land in different meal occasions depending on the chosen representative product type.
+- The aggregate section reranks the first-place product from every type shown in `Top Products by Type`, including both original basket items and workbook-inferred product types, so those bottom-of-report aggregate ranks are on a shared scale.

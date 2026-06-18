@@ -1,0 +1,445 @@
+---
+title: "Grocery Pricing Overview"
+subtitle: "Coverage statistics and a short walkthrough of the Streamlit app"
+author: "Grocery Pricing Project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+root_dir <- getwd()
+
+if (!file.exists(file.path(root_dir, "scripts", "run-r.sh"))) {
+  candidate_root <- normalizePath(file.path(root_dir, ".."), winslash = "/", mustWork = FALSE)
+  if (file.exists(file.path(candidate_root, "scripts", "run-r.sh"))) {
+    root_dir <- candidate_root
+  } else {
+    stop("Run this document from the repo root or from analysis/.", call. = FALSE)
+  }
+}
+
+library(dplyr)
+library(ggplot2)
+library(htmltools)
+library(knitr)
+library(readr)
+library(scales)
+library(tidyr)
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 5.5,
+  out.width = "100%"
+)
+
+theme_set(
+  theme_minimal(base_size = 14) +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title.position = "plot",
+      plot.caption.position = "plot"
+    )
+)
+
+data_dir <- file.path(root_dir, "analysis", "grocery_pricing_for_friends_data")
+asset_dir <- file.path(root_dir, "analysis", "grocery_pricing_for_friends_assets")
+
+required_files <- c(
+  "snapshot_metadata.csv",
+  "dataset_overview.csv",
+  "rows_by_year.csv",
+  "rows_by_location_type.csv",
+  "year_location_type.csv",
+  "top_chains_by_rows.csv",
+  "hannaford_example_row.csv",
+  "confirmed_overview.csv",
+  "confirmed_coverage_counts.csv",
+  "confirmed_by_task_group.csv",
+  "largest_confirmed_stores.csv",
+  "confirmed_row_distribution.csv",
+  "qaqc_overview.csv"
+)
+
+missing_required <- required_files[!file.exists(file.path(data_dir, required_files))]
+if (length(missing_required) > 0) {
+  stop(
+    paste(
+      "Missing report inputs:",
+      paste(missing_required, collapse = ", "),
+      "Run python scripts/generate_publication_inputs.py first."
+    ),
+    call. = FALSE
+  )
+}
+
+snapshot_metadata <- read_csv(file.path(data_dir, "snapshot_metadata.csv"), show_col_types = FALSE)
+dataset_overview <- read_csv(file.path(data_dir, "dataset_overview.csv"), show_col_types = FALSE)
+rows_by_year <- read_csv(file.path(data_dir, "rows_by_year.csv"), show_col_types = FALSE)
+rows_by_location_type <- read_csv(file.path(data_dir, "rows_by_location_type.csv"), show_col_types = FALSE)
+year_location_type <- read_csv(file.path(data_dir, "year_location_type.csv"), show_col_types = FALSE)
+top_chains_by_rows <- read_csv(file.path(data_dir, "top_chains_by_rows.csv"), show_col_types = FALSE)
+hannaford_example_row <- read_csv(file.path(data_dir, "hannaford_example_row.csv"), show_col_types = FALSE)
+confirmed_overview <- read_csv(file.path(data_dir, "confirmed_overview.csv"), show_col_types = FALSE)
+confirmed_coverage_counts <- read_csv(file.path(data_dir, "confirmed_coverage_counts.csv"), show_col_types = FALSE)
+confirmed_by_task_group <- read_csv(file.path(data_dir, "confirmed_by_task_group.csv"), show_col_types = FALSE)
+largest_confirmed_stores <- read_csv(file.path(data_dir, "largest_confirmed_stores.csv"), show_col_types = FALSE)
+confirmed_row_distribution <- read_csv(file.path(data_dir, "confirmed_row_distribution.csv"), show_col_types = FALSE)
+qaqc_overview <- read_csv(file.path(data_dir, "qaqc_overview.csv"), show_col_types = FALSE)
+
+value_for <- function(frame, metric_name) {
+  frame %>% filter(metric == metric_name) %>% pull(value) %>% .[[1]]
+}
+
+fmt_num <- function(x, digits = 0) {
+  format(round(as.numeric(x), digits), big.mark = ",", trim = TRUE, nsmall = digits)
+}
+
+fmt_pct <- function(x, digits = 1) {
+  percent(as.numeric(x), accuracy = 10^-digits)
+}
+
+fmt_snapshot <- function(x) {
+  format(as.POSIXct(x, tz = "UTC"), "%Y-%m-%d %H:%M UTC")
+}
+
+render_table <- function(data, caption = NULL, digits = NULL) {
+  args <- list(
+    x = data,
+    format = "html",
+    caption = caption,
+    table.attr = 'class="table table-striped table-bordered table-hover table-condensed" style="width:auto; margin-bottom: 22px;"'
+  )
+  if (!is.null(digits)) {
+    args$digits <- digits
+  }
+  do.call(knitr::kable, args)
+}
+
+friendly_task_group <- function(x) {
+  out <- sub("^task_group_", "", x)
+  out <- gsub("_", " ", out)
+  tools::toTitleCase(out)
+}
+
+metric_card <- function(label, value, note = NULL) {
+  note_html <- if (is.null(note)) {
+    ""
+  } else {
+    paste0("<div class=\"metric-note\">", htmlEscape(note), "</div>")
+  }
+
+  paste0(
+    "<div class=\"metric-card\">",
+    "<div class=\"metric-label\">", htmlEscape(label), "</div>",
+    "<div class=\"metric-value\">", htmlEscape(value), "</div>",
+    note_html,
+    "</div>"
+  )
+}
+
+location_palette <- c(
+  "chain-wide" = "#8b5cf6",
+  "store-specific" = "#0f766e",
+  "city-level" = "#2563eb",
+  "unknown" = "#94a3b8"
+)
+
+snapshot_table <- snapshot_metadata %>%
+  transmute(
+    Source = source_name,
+    File = path,
+    `Snapshot (UTC)` = vapply(snapshot_utc, fmt_snapshot, character(1)),
+    `Rows in report scope` = comma(rows_in_report_scope),
+    Notes = notes
+  )
+
+all_rows <- as.numeric(value_for(dataset_overview, "price_rows"))
+all_chains <- as.numeric(value_for(dataset_overview, "unique_chains"))
+all_sources <- as.numeric(value_for(dataset_overview, "unique_source_files"))
+non_sale_rows <- as.numeric(value_for(dataset_overview, "non_sale_rows"))
+sale_rows <- as.numeric(value_for(dataset_overview, "sale_rows"))
+all_cited <- as.numeric(value_for(dataset_overview, "rows_missing_wayback_url")) == 0
+full_six_year_sources <- as.numeric(value_for(dataset_overview, "sources_with_all_6_years"))
+
+registry_entries <- as.numeric(value_for(confirmed_overview, "registry_entries"))
+full_confirmed <- as.numeric(value_for(confirmed_overview, "full_2020_2025_entries"))
+partial_confirmed <- as.numeric(value_for(confirmed_overview, "partial_entries"))
+recorded_full_confirmed_rows <- as.numeric(value_for(confirmed_overview, "full_coverage_recorded_total_rows"))
+recorded_full_confirmed_non_sale <- as.numeric(value_for(confirmed_overview, "full_coverage_recorded_non_sale_rows"))
+blank_locations <- as.numeric(value_for(confirmed_overview, "blank_location_fields"))
+qaqc_flagged_total <- as.numeric(value_for(qaqc_overview, "flagged_files_total"))
+qaqc_flagged_in_parquet <- as.numeric(value_for(qaqc_overview, "flagged_files_present_in_parquet"))
+
+rows_by_year <- rows_by_year %>% mutate(year = factor(year, levels = year))
+confirmed_row_distribution$row_band <- factor(
+  confirmed_row_distribution$row_band,
+  levels = c("1-99", "100-999", "1,000-9,999", "10,000-49,999", "50,000+")
+)
+
+```
+
+```{r css, results='asis'}
+cat(
+  "<style>
+  .metric-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 14px;
+    margin: 18px 0 26px 0;
+  }
+  .metric-card {
+    border: 1px solid #dbe4ea;
+    border-radius: 12px;
+    background: #f8fbfd;
+    padding: 16px 18px;
+  }
+  .metric-label {
+    color: #48616f;
+    font-size: 0.95rem;
+    margin-bottom: 8px;
+  }
+  .metric-value {
+    color: #123244;
+    font-size: 1.9rem;
+    font-weight: 700;
+    line-height: 1.1;
+  }
+  .metric-note {
+    color: #5e7684;
+    font-size: 0.88rem;
+    margin-top: 8px;
+  }
+  .callout {
+    border-left: 5px solid #2c7fb8;
+    background: #f4f9fc;
+    padding: 14px 16px;
+    margin: 18px 0;
+  }
+  @media (max-width: 960px) {
+    .metric-grid { grid-template-columns: 1fr; }
+  }
+  </style>"
+)
+```
+
+# Overview
+
+This document is a data-first overview of the grocery pricing archive currently powering the Streamlit dashboard. It is intended to answer two different questions:
+
+1. How much pricing data is currently in the app-facing analytic snapshot?
+2. How many stores have been strong enough to count as confirmed multi-year coverage cases of the OFRA basket?
+
+
+## Collection Methodology
+
+The grocery pricing dataset is scraped from Internet Archive records of SNAP-eligible grocery store chains in the United States. 
+
+## What the Raw Data Looks Like
+
+Each row in the dataset is a price at a specific point in time for a specific item at a specific chain. The best way to see that is to line up an archived grocery page with one extracted row from the data.
+
+The screenshot below shows a Hannaford soups page captured by the Wayback Machine on April 11, 2020. One of the visible items is `Maruchan Instant Beef Flavor Noodle Soup Cup`, which also appears as a row app dataset.
+
+```{r hannaford-source-screenshot, fig.cap="", fig.height=8.2}
+knitr::include_graphics(file.path(asset_dir, "hannaford_wayback_source.png"))
+```
+
+```{r hannaford-example-row}
+hannaford_example_table <- hannaford_example_row %>%
+  mutate(
+    price = dollar(price),
+    sale = ifelse(sale, "TRUE", "FALSE")
+  ) %>%
+  rename(
+    Timestamp = timestamp,
+    Chain = chain,
+    Location = location,
+    Product = product_name,
+    Price = price,
+    Unit = unit,
+    Sale = sale,
+    Category = category,
+    Year = year,
+    `Location type` = location_type,
+    `Wayback URL` = wayback_url
+  )
+
+render_table(hannaford_example_table, caption = "Extracted row corresponding to the visible Hannaford product example")
+```
+
+
+```{r metric-cards, results='asis'}
+cards <- c(
+  metric_card("App-facing price rows (2020-2025)", fmt_num(all_rows), "Inclusive of sale and non-sale data."),
+  metric_card("Unique chains", fmt_num(all_chains), "Distinct chain names in the analytic snapshot."),
+  metric_card("Unique source files", fmt_num(all_sources), "Distinct contributing CSV sources represented in the parquet.")
+)
+
+cat(paste0("<div class=\"metric-grid\">", paste(cards, collapse = ""), "</div>"))
+```
+
+```{r snapshot-callout, results='asis'}
+cat(
+  sprintf(
+    "<div class='callout'><strong>Important caveat.</strong> These values are computed as of April 9, 2026. Actual app counts may have changed as additional data is collected</code>.</div>"
+  )
+)
+```
+
+# App-Facing Dataset Coverage
+
+The analytic snapshot currently contains **`r fmt_num(all_rows)` price rows** from **`r fmt_num(all_chains)` chains** and **`r fmt_num(all_sources)` source files** in the `2020-2025` window. Every row in this snapshot has a nonblank Wayback citation URL.
+
+The year-by-year distribution is not flat. Coverage rises sharply in `2024` and `2025`, but the archive still contains meaningful volume in every year back to `2020`.
+
+```{r rows-by-year-plot, fig.height=4.8}
+ggplot(rows_by_year, aes(x = year, y = rows)) +
+  geom_col(fill = "#2c7fb8", width = 0.72) +
+  geom_text(aes(label = comma(rows)), vjust = -0.3, size = 4) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title = "Price rows by year in the app-facing snapshot",
+    x = NULL,
+    y = "Rows"
+  )
+```
+
+```{r rows-by-year-table}
+rows_by_year_table <- rows_by_year %>%
+  mutate(
+    rows = comma(rows),
+    unique_chains = comma(unique_chains),
+    unique_sources = comma(unique_sources),
+    median_price = dollar(median_price),
+    non_sale_rows = comma(non_sale_rows),
+    sale_rows = comma(sale_rows)
+  ) %>%
+  rename(
+    Year = year,
+    Rows = rows,
+    Chains = unique_chains,
+    Sources = unique_sources,
+    `Median price` = median_price,
+    `Non-sale rows` = non_sale_rows,
+    `Sale rows` = sale_rows
+  )
+
+render_table(rows_by_year_table, caption = "App-facing coverage by year")
+```
+
+## Sale status and location specificity
+
+Most app-facing rows are marked non-sale, but the archive still contains a sizable sale layer. The location story is more mixed: a large share of rows are chain-wide, while store-specific and city-level records make up the strongest part of the map-oriented experience.
+
+```{r location-type-plot, fig.height=4.5}
+ggplot(rows_by_location_type, aes(x = reorder(location_type, rows), y = rows, fill = location_type)) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_text(aes(label = comma(rows)), hjust = -0.1, size = 4) +
+  coord_flip() +
+  scale_fill_manual(values = location_palette) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.14))) +
+  labs(
+    title = "Rows by location type",
+    x = NULL,
+    y = "Rows"
+  )
+```
+
+```{r year-location-type-plot, fig.height=5.1}
+ggplot(year_location_type, aes(x = factor(year), y = rows, fill = location_type)) +
+  geom_col(width = 0.72) +
+  scale_fill_manual(values = location_palette) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "How location-type coverage changes by year",
+    x = NULL,
+    y = "Rows",
+    fill = "Location type"
+  )
+```
+
+The heaviest row-producing sources in the app-facing snapshot are not all equally clean or equally mission-qualified. Some are excellent store-specific datasets; others are large but chain-wide or QA-heavy. That is why raw app coverage and confirmed-store counts should not be treated as the same thing.
+
+```{r top-chains-table}
+top_chains_table <- top_chains_by_rows %>%
+  transmute(
+    Chain = chain,
+    Rows = comma(rows),
+    `Years represented` = unique_years,
+    `Location types` = location_types
+  )
+
+render_table(top_chains_table, caption = "Largest chains in the app-facing snapshot")
+```
+
+# How to Use the App
+
+The Streamlit app is best understood as a guided way to move from broad coverage to specific evidence.
+
+## Step 1: Start on the Pricing Map
+
+Use the left sidebar to narrow the dataset before reading any statistics. The most important controls are:
+
+- product categories or baskets
+- sale status
+- location precision
+- year range
+
+The map and the right-hand directory panel update together.
+
+```{r screenshot-pricing-map, fig.cap="Pricing Map. Start here: set the filters in the left sidebar, then use the map and directory panel together to decide which parts of the archive you want to inspect.", fig.height=7.8}
+knitr::include_graphics(file.path(asset_dir, "app_pricing_map.png"))
+```
+
+## Step 2: Scroll down to the aggregate statistics
+
+Once the filters are set, the Pricing Map tab also acts like a summary dashboard. This is the quickest way to see how many rows, chains, and products survive the current filter choices, along with a year-over-year median price view.
+
+```{r screenshot-aggregate, fig.cap="Pricing Map with the aggregate statistics section visible. This is the fastest way to turn the current filter settings into a quantitative summary.", fig.height=7.8}
+knitr::include_graphics(file.path(asset_dir, "app_aggregate_statistics.png"))
+```
+
+## Step 3: Use Product View to rank what is actually available
+
+The Product View tab shifts attention away from geography and toward item-level breadth. It is useful for asking which product names have the most data points, how many years they cover, and how widely they appear across chains and locations.
+
+```{r screenshot-product-view, fig.cap="Product View. After tightening the sidebar filters, this tab is useful for ranking products by observations, chain count, years covered, and price levels.", fig.height=7.8}
+knitr::include_graphics(file.path(asset_dir, "app_product_view.png"))
+```
+
+## Step 4: Use the Harter House tab as a guided case study
+
+The Harter House case study is the most presentation-ready part of the app. It turns a single chain into a narrative example, showing geography, bundle structure, and time-series evidence in one place.
+
+```{r screenshot-harter, fig.cap="Harter House Case Study. This tab is the clearest single example of how the archive can be turned into an interpretable historical pricing story.", fig.height=7.8}
+knitr::include_graphics(file.path(asset_dir, "app_harter_house_case_study.png"))
+```
+
+# Key Caveats
+
+Several caveats matter for any public reading of the archive:
+
+1. **Data collection is ongoing.** This report reflects current collection status at time of writing. The app dataset may have been added or modified subsequent to report publication.
+2. **Geographic precision varies.** The app contains chain-wide, city-level, unknown-location, and partially qualified material alongside the strongest store-specific records.
+3. **Quality review is still active.** The current QAQC summary flags **`r fmt_num(qaqc_flagged_total)` files** overall, and **`r fmt_num(qaqc_flagged_in_parquet)` of those flagged basenames** still appear in the current dataset snapshot.
+4. **Some very large sources are not the strongest inflation evidence.** Large chain-wide or noisy sources can dominate raw row counts while still being weaker than smaller, cleaner store-specific series.
+
+# Bottom Line
+
+The archive is already large enough to be more than a proof of concept.
+
+- At the app level, it currently exposes **`r fmt_num(all_rows)` price rows** from **`r fmt_num(all_chains)` chains** and **`r fmt_num(all_sources)` source files** in the `2020-2025` window.
+- At the stricter registry level, it currently lists **`r fmt_num(full_confirmed)` full-coverage confirmed stores** out of **`r fmt_num(registry_entries)` total entries**.
+- The app is already usable as an exploratory tool: start with the Pricing Map, read the aggregate statistics, move to Product View for item-level breadth, and use Harter House as a model case study.
+
+The main caution is not that the archive lacks data. It is that the archive contains layers of data with different strengths. **The best way to use the app is to keep those layers explicit**.

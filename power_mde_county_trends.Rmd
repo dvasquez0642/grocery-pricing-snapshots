@@ -1,0 +1,875 @@
+---
+title: "County-Level Grocery Price Trend: Statistical Power Analysis"
+author: "Grocery Pricing Project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, message = FALSE, warning = FALSE,
+  fig.width = 10, fig.height = 6
+)
+options(scipen = 999)
+library(readxl)
+library(data.table)
+```
+
+# Overview
+
+This report answers a simple question: **when we receive county-level NielsenIQ
+Homescan receipt data, which product categories will have enough observations to
+support reliable trend analysis of price per unit?**
+
+The approach:
+
+- For each product category, compute the **minimum detectable annual price trend
+  (MDE)** at 80% power, as a function of the number of purchase transactions
+  observed per county per week.
+- Express results as the **minimum viable weekly n** -- the transaction count
+  a county-category cell needs to detect a 2%, 5%, or 10% annual price trend.
+- Validate the analytical formula against simulation.
+
+## Key assumptions
+
+| Assumption | Value | Notes |
+|:-----------|:------|:------|
+| Estimand | Annual % change in log(price per unit) | Scale-free; directly interpretable |
+| Model | `log(p) ~ week + month_dummies` | OLS with 11 seasonal controls |
+| Inference | Sandwich (Newey-West) standard errors | Robust to AR(1) autocorrelation |
+| Power target | 80%, two-sided alpha = 0.05 | Standard |
+| Autocorrelation | Sweep rho = 0, 0.3, 0.5, 0.7 | Weekly shelf prices are sticky |
+| Transaction-level SD | 0.15 / 0.30 / 0.50 | Standardised index / typical / raw mean |
+| Time spans | 104, 156, 208, 260 weeks (2-5 years) | |
+
+# Data: NielsenIQ product hierarchy
+
+```{r load-data}
+here <- getwd()
+# Navigate up if we're in the analysis subfolder
+if (basename(here) == "analysis") here <- dirname(here)
+
+hierarchy_path <- file.path(here, "Homescan Disagg Hierarchy.xlsx")
+
+# Read hierarchy
+raw <- as.data.table(read_excel(hierarchy_path, sheet = "1-Table-1", skip = 8))
+setnames(raw, paste0("V", seq_len(ncol(raw))))
+hier <- raw[!is.na(V9), .(
+  department    = V5,
+  supercategory = V6,
+  category      = V7,
+  raw_occasions = as.numeric(V9)
+)]
+
+# Tag the 20 NHANES-recommended supercategories
+# (from nhanes_meal_archetypes analysis -- coverage-maximising selection)
+nhanes_picks <- toupper(c(
+  "CEREAL & GRANOLA",
+  "COFFEE",
+  "BREAD",
+  "MILK PRODUCTS",
+  "EGGS",
+  "SALTY SNACKS",
+  "COOKIES & CRACKERS",
+  "DESSERTS/SWEET GOODS",
+  "PREPARED FOODS",
+  "MEAL COMBOS",
+  "PASTA/RICE/GRAINS",
+  "VEGETABLES",
+  "FRUIT",
+  "CHEESE",
+  "BEVERAGES",
+  "PIZZA",
+  "WRAPS & TORTILLA SHELLS",
+  "CONDIMENTS",
+  "SEAFOOD",
+  "NUT BUTTERS/JAM/JELLIES"
+))
+hier[, in_selection := toupper(trimws(supercategory)) %in% nhanes_picks]
+
+# Supercategory-level aggregation
+sc <- hier[, .(
+  n_categories   = .N,
+  total_occ      = sum(raw_occasions),
+  min_cat_occ    = min(raw_occasions),
+  median_cat_occ = median(raw_occasions),
+  in_selection   = any(in_selection)
+), by = supercategory]
+setorder(sc, -total_occ)
+```
+
+The Homescan Disagg Hierarchy contains **`r nrow(hier)` product categories**
+across **`r uniqueN(hier$supercategory)` supercategories**. Of these,
+**`r uniqueN(hier[in_selection == TRUE, supercategory])` supercategories** have
+been selected based on the NHANES meal-archetype analysis (a
+coverage-maximising 20-category pick designed to reconstruct as many meal
+patterns as possible from Homescan purchase data). These cover
+**`r nrow(hier[in_selection == TRUE])` categories** and
+**`r format(hier[in_selection == TRUE, sum(raw_occasions)], big.mark = ",")`
+national purchase occasions** in the latest 52-week period.
+
+```{r hierarchy-table}
+sel_sc <- sc[in_selection == TRUE]
+knitr::kable(
+  sel_sc[, .(
+    Supercategory   = supercategory,
+    Categories      = n_categories,
+    `National Occ.` = format(total_occ, big.mark = ","),
+    `Min Cat Occ.`  = format(min_cat_occ, big.mark = ","),
+    `Median Cat Occ.` = format(median_cat_occ, big.mark = ",")
+  )],
+  caption = "NHANES-recommended 20 supercategories, sorted by total national occasions"
+)
+```
+
+The distribution of national occasions is extremely right-skewed: the median
+category has about `r format(round(median(hier$raw_occasions)), big.mark = ",")`
+occasions nationally, but the 10th percentile is only
+`r round(quantile(hier$raw_occasions, 0.10))`. Once spread across 1,000+
+counties, many cells will be thin.
+
+```{r occasions-histogram, fig.height=5}
+par(mar = c(5, 4, 3, 1))
+cutoff <- 100000L
+n_above <- sum(hier$raw_occasions > cutoff)
+vals <- hier$raw_occasions[hier$raw_occasions <= cutoff]
+h <- hist(vals, breaks = 40, plot = FALSE)
+n_bars <- length(h$counts)
+
+bp <- barplot(h$counts, space = 0, col = "#67a9cf", border = "white",
+     main = paste0("Distribution of national Raw Occasions per category",
+                   "\n(", n_above, " categories above ",
+                   formatC(cutoff, format = "d", big.mark = ","), " not shown)"),
+     xlab = "Raw Occasions (national, latest 52 weeks)",
+     ylab = "Number of categories",
+     xaxt = "n")
+
+at_labels <- seq(0, cutoff, by = 20000)
+at_pos <- sapply(at_labels, function(v) {
+  (v - h$breaks[1]) / diff(range(h$breaks)) * n_bars
+})
+axis(1, at = at_pos, labels = format(at_labels, big.mark = ","))
+
+# Reference lines: map values to barplot coordinates
+med_pos <- (median(hier$raw_occasions) - h$breaks[1]) /
+           diff(range(h$breaks)) * n_bars
+p10_pos <- (quantile(hier$raw_occasions, 0.10) - h$breaks[1]) /
+           diff(range(h$breaks)) * n_bars
+abline(v = med_pos, lty = 2, lwd = 2, col = "#b2182b")
+abline(v = p10_pos, lty = 3, lwd = 2, col = "#ef8a62")
+legend("topright", bty = "n",
+       legend = c(
+         paste0("Median: ", format(round(median(hier$raw_occasions)), big.mark = ",")),
+         paste0("10th pctile: ", round(quantile(hier$raw_occasions, 0.10)))
+       ),
+       col = c("#b2182b", "#ef8a62"), lty = c(2, 3), lwd = 2)
+```
+
+```{r key-findings-compute, include=FALSE}
+hier_sel <- hier[in_selection == TRUE]
+n_cats_total <- nrow(hier_sel)
+n_infeasible_large <- sum(hier_sel$raw_occasions * 0.005 / 52 < 1.6)
+n_infeasible_mid   <- sum(hier_sel$raw_occasions * 0.001 / 52 < 1.6)
+n_infeasible_small <- sum(hier_sel$raw_occasions * 0.0002 / 52 < 1.6)
+```
+
+# Key findings
+
+> **Supercategory-level analysis is viable in most counties.** At the
+> supercategory level (e.g. all of VEGETABLES, all of CHEESE), the 20
+> NHANES-recommended picks have enough volume for county-level price-trend
+> detection in large and mid-size counties with 5 years of data.
+>
+> **Category-level analysis is not.** When you drill down to individual
+> categories (e.g. *Tomatoes*, *Cheddar*, *Potato Chip*), the picture is far
+> more sobering:
+>
+> - **`r n_infeasible_large` of `r n_cats_total` categories (`r round(100*n_infeasible_large/n_cats_total)`%) are infeasible even in large metro counties** -- too few transactions for a single nonzero week.
+> - **`r n_infeasible_mid` of `r n_cats_total` (`r round(100*n_infeasible_mid/n_cats_total)`%) are infeasible in mid-size counties.**
+> - **`r n_infeasible_small` of `r n_cats_total` (`r round(100*n_infeasible_small/n_cats_total)`%) are infeasible in small/rural counties.**
+>
+> Only the highest-volume categories (SOFT DRINKS, COWS MILK, BREAD, CHICKEN
+> EGGS, POTATOES, POTATO CHIP, and roughly 50--80 others) can support
+> category-level county trend analysis. For everything else, you must work at
+> the supercategory aggregate or use pooled/hierarchical models.
+>
+> **The single highest-leverage methodological choice is building a standardised
+> price index** (e.g. price-per-ounce or UPC fixed effects) rather than using
+> raw category mean prices. This roughly halves the minimum detectable effect
+> for every cell.
+
+# Method
+
+## The MDE formula
+
+We model weekly county-category log mean price as:
+
+$$\log(p_w) = \alpha + \beta \cdot w + \sum_{m=2}^{12} \gamma_m \cdot \mathbf{1}[\text{month}=m] + \varepsilon_w$$
+
+where $\varepsilon_w$ follows an AR(1) process with persistence $\rho$.
+
+The OLS slope estimator $\hat\beta$ has true variance under AR(1) errors:
+
+$$\text{Var}(\hat\beta) = \sigma_w^2 \cdot \left[ (X'X)^{-1} X' \Omega X (X'X)^{-1} \right]_{2,2}$$
+
+where $\Omega_{ij} = \rho^{|i-j|}$ is the AR(1) correlation matrix, and
+$\sigma_w^2 = \sigma_{\text{txn}}^2 / n + \sigma_{\text{week}}^2$ is the
+variance of the weekly log mean price (combining transaction-level variance
+averaged down by $n$ transactions, plus irreducible week-level variance).
+
+The **sandwich form** is computed numerically for each $(T, \rho)$ combination
+-- this is exact, unlike the commonly used `sqrt((1+rho)/(1-rho))`
+approximation which applies only to sample means, not regression slopes with
+covariates.
+
+The MDE (annualised) is then:
+
+$$\text{MDE}_{\text{annual}} = 52 \times (t_{\alpha/2, df} + t_{\text{power}, df}) \times \text{SE}_{\text{sandwich}}(\hat\beta)$$
+
+converted from log-points to percentage via $100 \times (e^{\text{MDE}} - 1)$.
+
+## Feasibility filter
+
+Before computing MDEs, we check whether a county-category cell has enough
+nonzero weeks. Under a Poisson arrival model, the expected fraction of nonzero
+weeks is $1 - e^{-n}$ where $n$ is the expected weekly transaction count. We
+require at least 77% of weeks to have $\geq 1$ transaction (annualised: 40 out
+of 52 weeks), implying a minimum expected $n \approx 1.6$ per week.
+
+```{r compute-mde}
+# --- Parameter grid ---
+weekly_n_vals  <- c(1, 2, 5, 10, 25, 50, 100, 250, 500)
+T_vals         <- c(104L, 156L, 208L, 260L)
+rho_vals       <- c(0.0, 0.3, 0.5, 0.7)
+sigma_txn_vals <- c(0.15, 0.30, 0.50)
+sigma_week_vals <- c(0.01, 0.03)
+target_power   <- 0.80
+alpha          <- 0.05
+
+grid <- CJ(
+  weekly_n   = weekly_n_vals,
+  T_weeks    = T_vals,
+  rho        = rho_vals,
+  sigma_txn  = sigma_txn_vals,
+  sigma_week = sigma_week_vals
+)
+
+# Feasibility filter
+grid[, nonzero_weeks := T_weeks * (1 - exp(-weekly_n))]
+grid[, pct_coverage  := nonzero_weeks / T_weeks]
+grid[, feasible := pct_coverage >= 40/52]
+
+# --- Sandwich variance computation ---
+sandwich_cache <- list()
+
+get_slope_var_factor <- function(T_weeks, rho) {
+  key <- paste(T_weeks, rho, sep = "_")
+  if (!is.null(sandwich_cache[[key]])) return(sandwich_cache[[key]])
+  
+  weeks <- seq_len(T_weeks)
+  month_of_week <- ((weeks - 1) %% 52) %/% 4 + 1
+  month_of_week[month_of_week > 12] <- 12
+  month_mat <- model.matrix(~ factor(month_of_week))[, -1]
+  X <- cbind(1, weeks, month_mat)
+  
+  Omega <- rho^abs(outer(weeks, weeks, "-"))
+  XtX_inv <- solve(crossprod(X))
+  sandwich <- XtX_inv %*% crossprod(X, Omega %*% X) %*% XtX_inv
+  
+  result <- list(
+    sandwich_var = sandwich[2, 2],
+    iid_var      = XtX_inv[2, 2],
+    df           = T_weeks - ncol(X)
+  )
+  sandwich_cache[[key]] <<- result
+  return(result)
+}
+
+# Pre-populate cache
+for (tw in T_vals) for (r in rho_vals) get_slope_var_factor(tw, r)
+
+# --- MDE function ---
+compute_mde <- function(weekly_n, T_weeks, rho, sigma_txn, sigma_week,
+                         alpha = 0.05, power = 0.80) {
+  sigma_w <- sqrt(sigma_txn^2 / weekly_n + sigma_week^2)
+  sv <- get_slope_var_factor(T_weeks, rho)
+  df <- sv$df
+  if (df < 3) return(NA_real_)
+  t_alpha <- qt(1 - alpha/2, df)
+  t_power <- qt(power, df)
+  se_b_true <- sigma_w * sqrt(sv$sandwich_var)
+  mde_annual <- 52 * (t_alpha + t_power) * se_b_true
+  mde_pct <- 100 * (exp(mde_annual) - 1)
+  return(mde_pct)
+}
+
+grid[feasible == TRUE, mde_pct := mapply(
+  compute_mde, weekly_n, T_weeks, rho, sigma_txn, sigma_week,
+  MoreArgs = list(alpha = alpha, power = target_power)
+)]
+
+grid[feasible == TRUE, verdict := fcase(
+  mde_pct <  2, "well_powered",
+  mde_pct <  5, "adequate",
+  mde_pct < 10, "marginal",
+  mde_pct >= 10, "underpowered",
+  default = NA_character_
+)]
+grid[feasible == FALSE, verdict := "infeasible"]
+
+# --- Min-viable-n lookup ---
+thresholds <- c(2, 5, 10)
+min_n_list <- list()
+for (thresh in thresholds) {
+  tmp <- grid[feasible == TRUE & mde_pct < thresh,
+              .(min_weekly_n = min(weekly_n)),
+              by = .(T_weeks, rho, sigma_txn, sigma_week)]
+  tmp[, mde_threshold := thresh]
+  min_n_list[[as.character(thresh)]] <- tmp
+}
+min_n_table <- rbindlist(min_n_list)
+setorder(min_n_table, sigma_txn, rho, T_weeks, mde_threshold)
+```
+
+# Results
+
+## Five years of data substantially improves power
+
+With 5 years (260 weeks) of receipt data, the model has 247 residual degrees
+of freedom after fitting the intercept, trend, and 11 month dummies. This is a
+large improvement over 2 years (91 df) -- more weeks means both more precise
+slope estimates and better-behaved t-statistics. The tables below show how
+minimum-n requirements drop as the time span increases from 2 to 5 years.
+
+## Minimum viable weekly n
+
+The tables below show the minimum average weekly transaction count needed per
+county-category cell to detect a given annual price trend, at 80% power. All
+use $\sigma_{\text{week}} = 0.01$ (conservative).
+
+### Standardised price index ($\sigma_{\text{txn}} = 0.15$)
+
+A standardised index normalises for package size and brand mix -- the cleanest
+measure of actual price movement.
+
+```{r table-std}
+make_min_n_display <- function(s_txn, s_week = 0.01) {
+  out <- data.table()
+  for (tw in T_vals) {
+    for (r in rho_vals) {
+      vals <- sapply(thresholds, function(th) {
+        row <- min_n_table[sigma_txn == s_txn & sigma_week == s_week &
+                             T_weeks == tw & rho == r & mde_threshold == th]
+        if (nrow(row) == 0) "> 500" else as.character(row$min_weekly_n)
+      })
+      out <- rbind(out, data.table(
+        `Time span` = paste0(tw, " wks (", tw/52, " yr)"),
+        `Autocorrelation (rho)` = r,
+        `MDE < 2%/yr` = vals[1],
+        `MDE < 5%/yr` = vals[2],
+        `MDE < 10%/yr` = vals[3]
+      ))
+    }
+  }
+  return(out)
+}
+knitr::kable(make_min_n_display(0.15),
+             caption = "Minimum weekly n: standardised price index (sigma_txn = 0.15)")
+```
+
+### Typical category ($\sigma_{\text{txn}} = 0.30$)
+
+Representative of a reasonably well-defined product category or a decent price
+index with some residual mix noise.
+
+```{r table-typ}
+knitr::kable(make_min_n_display(0.30),
+             caption = "Minimum weekly n: typical category (sigma_txn = 0.30)")
+```
+
+### Raw category mean ($\sigma_{\text{txn}} = 0.50$)
+
+If you use the unweighted average receipt price across all UPCs in a category,
+package-size and brand mixing inflate variance substantially.
+
+```{r table-raw}
+knitr::kable(make_min_n_display(0.50),
+             caption = "Minimum weekly n: raw category mean (sigma_txn = 0.50)")
+```
+
+**Reading these tables:** at the intersection of your time span, autocorrelation
+assumption, and desired MDE threshold, the number shown is the minimum average
+weekly transaction count a county-category cell needs. For example, with 5 years
+of data, moderate autocorrelation ($\rho = 0.5$), and a typical category
+($\sigma = 0.30$), look up the row for 260 wks / rho = 0.5 to find the
+required weekly n for each MDE threshold.
+
+## Category feasibility: NHANES-recommended 20
+
+The tables below map these thresholds to the 20 NHANES-recommended
+supercategories using three illustrative county-size scenarios: **large metro**
+(0.5% of the national panel), **mid-size** (0.1%), and **small/rural** (0.02%).
+All assume **5 years of data** (260 weeks) and moderate autocorrelation
+($\rho = 0.5$).
+
+```{r feasibility-tables, results='asis'}
+shares       <- c(0.005, 0.001, 0.0002)
+share_labels <- c("Large metro (0.5%)", "Mid-size (0.1%)", "Small/rural (0.02%)")
+
+for (s_txn in c(0.15, 0.30, 0.50)) {
+  label <- if (s_txn == 0.15) "Standardised index (sigma = 0.15)" else
+           if (s_txn == 0.30) "Typical category (sigma = 0.30)" else
+                              "Raw category mean (sigma = 0.50)"
+  
+  rows <- list()
+  for (i in seq_len(nrow(sel_sc))) {
+    row <- sel_sc[i]
+    vals <- character(3)
+    for (j in seq_along(shares)) {
+      wn <- row$total_occ * shares[j] / 52
+      if (wn < 1.6) {
+        vals[j] <- paste0("n=", round(wn, 1), " INFEASIBLE")
+      } else {
+        m <- compute_mde(weekly_n = wn, T_weeks = 260, rho = 0.5,
+                         sigma_txn = s_txn, sigma_week = 0.01)
+        verd <- if (is.na(m)) "NA" else
+                if (m < 2)  "well_powered" else
+                if (m < 5)  "adequate" else
+                if (m < 10) "marginal" else "underpowered"
+        vals[j] <- paste0(sprintf("%.1f%%", m), " ", verd)
+      }
+    }
+    rows[[i]] <- data.table(
+      Supercategory = row$supercategory,
+      `Natl Occasions` = format(row$total_occ, big.mark = ","),
+      V1 = vals[1], V2 = vals[2], V3 = vals[3]
+    )
+  }
+  tbl <- rbindlist(rows)
+  setnames(tbl, c("V1","V2","V3"), share_labels)
+  
+  cat("\n\n###", label, "\n\n")
+  print(knitr::kable(tbl,
+    caption = paste0("Feasibility at rho=0.5, T=260 weeks (5 yr): ", label)))
+  cat("\n")
+}
+```
+
+## Category-level feasibility
+
+The supercategory-level picture is encouraging, but most research questions
+target specific product categories (e.g. *Tomatoes*, *Cheddar*, *Potato Chip*),
+not broad aggregates like VEGETABLES or CHEESE. There are **`r nrow(hier[in_selection == TRUE])` categories** within the 20 NHANES-recommended supercategories, and many of them are far too thin for county-level work.
+
+```{r cat-level-compute}
+# Category-level feasibility at central scenario: T=260, rho=0.5, sigma_week=0.01
+cat_data <- hier[in_selection == TRUE, .(supercategory, category, raw_occasions)]
+setorder(cat_data, -raw_occasions)
+
+shares       <- c(0.005, 0.001, 0.0002)
+share_labels <- c("Large metro (0.5%)", "Mid-size (0.1%)", "Small/rural (0.02%)")
+sigma_txn_scenarios <- c(0.15, 0.30, 0.50)
+sigma_labels <- c("0.15" = "Std index", "0.3" = "Typical", "0.5" = "Raw mean")
+
+# Compute MDE for every category x county-tier x sigma_txn combo
+cat_results <- list()
+for (s_txn in sigma_txn_scenarios) {
+  for (j in seq_along(shares)) {
+    tmp <- copy(cat_data)
+    tmp[, weekly_n := raw_occasions * shares[j] / 52]
+    tmp[, feasible := weekly_n >= 1.6]
+    tmp[feasible == TRUE, mde_pct := sapply(weekly_n, function(wn) {
+      compute_mde(wn, T_weeks = 260, rho = 0.5,
+                  sigma_txn = s_txn, sigma_week = 0.01)
+    })]
+    tmp[feasible == TRUE, verdict := fcase(
+      mde_pct <  2, "well_powered",
+      mde_pct <  5, "adequate",
+      mde_pct < 10, "marginal",
+      mde_pct >= 10, "underpowered"
+    )]
+    tmp[feasible == FALSE, verdict := "infeasible"]
+    tmp[, sigma_txn := s_txn]
+    tmp[, county_tier := share_labels[j]]
+    cat_results[[length(cat_results) + 1]] <- tmp
+  }
+}
+cat_all <- rbindlist(cat_results)
+```
+
+### Summary: how many categories survive?
+
+```{r cat-summary-table, results='asis'}
+verdict_order <- c("well_powered", "adequate", "marginal", "underpowered", "infeasible")
+
+for (s_txn in sigma_txn_scenarios) {
+  label <- sigma_labels[as.character(s_txn)]
+  sub <- cat_all[sigma_txn == s_txn]
+  
+  summ <- sub[, .N, by = .(county_tier, verdict)]
+  summ[, verdict := factor(verdict, levels = verdict_order)]
+  wide <- dcast(summ, county_tier ~ verdict, value.var = "N", fill = 0,
+                drop = FALSE)
+  # Ensure all verdict columns exist
+  for (v in verdict_order) {
+    if (!v %in% names(wide)) wide[, (v) := 0L]
+  }
+  # Reorder rows
+  wide[, county_tier := factor(county_tier, levels = share_labels)]
+  setorder(wide, county_tier)
+  wide[, Total := rowSums(.SD), .SDcols = verdict_order]
+  wide[, `Viable (MDE<10%)` := rowSums(.SD),
+       .SDcols = c("well_powered", "adequate", "marginal")]
+  
+  cat("\n\n####", paste0(label, " (sigma_txn = ", s_txn, ")"), "\n\n")
+  print(knitr::kable(wide,
+    caption = paste0("Category-level verdict counts (T=260 wks, rho=0.5): ", label)))
+  cat("\n")
+}
+```
+
+At **category level**, the picture is much more sobering than at supercategory
+level. Over half of the 381 categories are infeasible in mid-size counties, and
+the vast majority are infeasible in small/rural counties regardless of the
+variance scenario.
+
+### Distribution of category-level MDEs
+
+```{r cat-mde-histogram, fig.height=7}
+par(mfrow = c(3, 1), mar = c(4, 4, 3, 1), oma = c(0, 0, 2, 0))
+
+for (s_txn in sigma_txn_scenarios) {
+  label <- sigma_labels[as.character(s_txn)]
+  # Show large metro (best case) — feasible categories only
+  sub <- cat_all[sigma_txn == s_txn & county_tier == share_labels[1] &
+                   feasible == TRUE & !is.na(mde_pct)]
+  n_infeasible <- cat_all[sigma_txn == s_txn & county_tier == share_labels[1] &
+                            feasible == FALSE, .N]
+  
+  if (nrow(sub) > 0) {
+    vals <- pmin(sub$mde_pct, 30)  # truncate for display
+    h <- hist(vals, breaks = 30, plot = FALSE)
+    n_bars <- length(h$counts)
+    barplot(h$counts, space = 0, col = "#67a9cf", border = "white",
+            main = paste0(label, " -- Large metro counties",
+                          "\n(", n_infeasible, " of ",
+                          nrow(cat_data), " categories infeasible, not shown)"),
+            ylab = "Number of categories",
+            xlab = "MDE (% per year)",
+            xaxt = "n")
+    at_labels <- seq(0, 30, by = 5)
+    at_pos <- sapply(at_labels, function(v) {
+      (v - h$breaks[1]) / diff(range(h$breaks)) * n_bars
+    })
+    axis(1, at = at_pos, labels = paste0(at_labels, "%"))
+    # Threshold lines
+    for (thresh in c(2, 5, 10)) {
+      thresh_pos <- (thresh - h$breaks[1]) / diff(range(h$breaks)) * n_bars
+      abline(v = thresh_pos, lty = 2, lwd = 2, col = "grey40")
+    }
+  }
+}
+mtext("Category-level MDE distribution (large metro, T=260 wks, rho=0.5)",
+      outer = TRUE, cex = 1.1, font = 2)
+```
+
+### Which supercategories can support category-level analysis?
+
+The table below shows, for each supercategory, how many of its constituent
+categories are viable (MDE < 10%/yr) at each county tier.
+
+```{r cat-thinning-table, results='asis'}
+for (s_txn in sigma_txn_scenarios) {
+  label <- sigma_labels[as.character(s_txn)]
+  sub <- cat_all[sigma_txn == s_txn]
+  
+  thin <- sub[, .(
+    total    = .N,
+    viable   = sum(verdict %in% c("well_powered", "adequate", "marginal"))
+  ), by = .(supercategory, county_tier)]
+  
+  thin[, pct_viable := sprintf("%d/%d", viable, total)]
+  wide <- dcast(thin, supercategory ~ county_tier, value.var = "pct_viable")
+  
+  # Add total occasions for sorting
+  wide <- merge(wide, sc[, .(supercategory, total_occ)], by = "supercategory")
+  setorder(wide, -total_occ)
+  wide[, total_occ := NULL]
+  
+  # Reorder columns
+  setcolorder(wide, c("supercategory", share_labels))
+  
+  cat("\n\n####", paste0(label, " (sigma_txn = ", s_txn, ")"), "\n\n")
+  print(knitr::kable(wide,
+    caption = paste0("Viable categories per supercategory (MDE<10%, T=260 wks, rho=0.5): ",
+                     label),
+    col.names = c("Supercategory", share_labels)))
+  cat("\n")
+}
+```
+
+### Top viable categories in mid-size counties
+
+The following table lists categories that achieve MDE < 10%/yr in a mid-size
+county (0.1% of national panel), across all three variance scenarios. These are
+the categories where county-level trend analysis is most realistic.
+
+```{r cat-detail-table, results='asis'}
+for (s_txn in sigma_txn_scenarios) {
+  label <- sigma_labels[as.character(s_txn)]
+  
+  rows <- list()
+  for (i in seq_len(nrow(cat_data))) {
+    row <- cat_data[i]
+    vals <- character(3)
+    for (j in seq_along(shares)) {
+      wn <- row$raw_occasions * shares[j] / 52
+      if (wn < 1.6) {
+        vals[j] <- "INFEASIBLE"
+      } else {
+        m <- compute_mde(weekly_n = wn, T_weeks = 260, rho = 0.5,
+                         sigma_txn = s_txn, sigma_week = 0.01)
+        verd <- if (is.na(m)) "NA" else
+                if (m < 2)  "well_powered" else
+                if (m < 5)  "adequate" else
+                if (m < 10) "marginal" else "underpowered"
+        vals[j] <- paste0(sprintf("%.1f%%", m), " ", verd)
+      }
+    }
+    rows[[i]] <- data.table(
+      Supercategory = row$supercategory,
+      Category = row$category,
+      `Natl Occ` = format(row$raw_occasions, big.mark = ","),
+      V1 = vals[1], V2 = vals[2], V3 = vals[3]
+    )
+  }
+  tbl <- rbindlist(rows)
+  setnames(tbl, c("V1","V2","V3"), share_labels)
+  
+  # Filter to categories viable in mid-size county
+  tbl_viable <- tbl[!grepl("INFEASIBLE|underpowered", `Mid-size (0.1%)`)]
+  
+  cat("\n\n####", paste0(label, " (sigma_txn = ", s_txn, ")"), "\n\n")
+  if (nrow(tbl_viable) == 0) {
+    cat("*No categories achieve MDE < 10%/yr in mid-size counties at this variance level.*\n")
+  } else {
+    print(knitr::kable(tbl_viable,
+      caption = paste0("Categories viable in mid-size counties (MDE<10%, T=260 wks, rho=0.5): ",
+                       label)))
+  }
+  cat("\n")
+}
+```
+
+## MDE curves
+
+The plots below show how the minimum detectable effect (annual %) decreases as
+weekly transaction count increases, for each time span and autocorrelation
+level. The dashed lines mark the 2%, 5%, and 10% MDE thresholds. Solid lines
+show 2 years, dashed lines 5 years -- illustrating the power gain from the full
+data window.
+
+```{r mde-curves, fig.height=8}
+# Compute MDE on a finer n grid for plotting
+plot_n <- seq(2, 500, by = 1)
+plot_grid <- CJ(
+  weekly_n  = plot_n,
+  T_weeks   = T_vals,
+  rho       = rho_vals,
+  sigma_txn = c(0.15, 0.30, 0.50)
+)
+plot_grid[, mde_pct := mapply(
+  compute_mde, weekly_n, T_weeks, rho, sigma_txn,
+  MoreArgs = list(sigma_week = 0.01, alpha = alpha, power = target_power)
+)]
+
+# Limit display range
+plot_grid <- plot_grid[!is.na(mde_pct) & mde_pct < 50]
+
+sigma_labels <- c("0.15" = "Standardised index",
+                   "0.3"  = "Typical category",
+                   "0.5"  = "Raw category mean")
+
+par(mfrow = c(3, 1), mar = c(4, 4, 3, 1), oma = c(0, 0, 2, 0))
+rho_cols <- c("0"   = "#2166ac",
+              "0.3" = "#67a9cf",
+              "0.5" = "#ef8a62",
+              "0.7" = "#b2182b")
+
+for (s_txn in c(0.15, 0.30, 0.50)) {
+  sub <- plot_grid[sigma_txn == s_txn & T_weeks %in% c(104, 260)]
+  
+  plot(NULL, xlim = c(2, 300), ylim = c(0, 25),
+       xlab = "Weekly transactions per county-category",
+       ylab = "MDE (% per year)",
+       main = sigma_labels[as.character(s_txn)])
+  abline(h = c(2, 5, 10), lty = 2, col = "grey60")
+  text(290, c(2, 5, 10) + 0.6, c("2%", "5%", "10%"),
+       cex = 0.8, col = "grey40")
+  
+  for (tw in c(104, 260)) {
+    for (r in rho_vals) {
+      d <- sub[T_weeks == tw & rho == r]
+      if (nrow(d) == 0) next
+      lty_val <- if (tw == 104) 1 else 2
+      lines(d$weekly_n, d$mde_pct,
+            col = rho_cols[as.character(r)], lwd = 1.5, lty = lty_val)
+    }
+  }
+  
+  legend("topright", bty = "n", cex = 0.75, ncol = 2,
+         legend = c(paste0("rho=", names(rho_cols)), "2 years", "5 years"),
+         col = c(rho_cols, "black", "black"),
+         lty = c(rep(1, 4), 1, 2),
+         lwd = 1.5)
+}
+mtext("MDE vs. weekly transaction count (sigma_week = 0.01)", outer = TRUE,
+      cex = 1.1, font = 2)
+```
+
+# Simulation validation
+
+To confirm the analytical formula is correctly calibrated, we simulate 1,000
+datasets at the analytical MDE and check that the empirical rejection rate
+matches 80%.
+
+```{r simulation, cache=TRUE}
+set.seed(42)
+n_sim <- 1000L
+
+sim_combos <- data.table(
+  weekly_n   = c(10,   50,  100,  25),
+  T_weeks    = c(104, 208,  260, 156),
+  rho        = c(0.0, 0.5,  0.7, 0.3),
+  sigma_txn  = c(0.30, 0.30, 0.15, 0.50),
+  sigma_week = c(0.01, 0.01, 0.01, 0.03)
+)
+
+sim_results <- list()
+
+for (sc_i in seq_len(nrow(sim_combos))) {
+  p <- sim_combos[sc_i]
+  
+  sigma_w <- sqrt(p$sigma_txn^2 / p$weekly_n + p$sigma_week^2)
+  sv <- get_slope_var_factor(p$T_weeks, p$rho)
+  df <- sv$df
+  t_a <- qt(1 - alpha/2, df)
+  t_p <- qt(target_power, df)
+  se_b_true <- sigma_w * sqrt(sv$sandwich_var)
+  mde_slope <- (t_a + t_p) * se_b_true
+  
+  weeks <- seq_len(p$T_weeks)
+  month_of_week <- ((weeks - 1) %% 52) %/% 4 + 1
+  month_of_week[month_of_week > 12] <- 12
+  month_mat <- model.matrix(~ factor(month_of_week))[, -1]
+  Xfull <- cbind(1, weeks, month_mat)
+  XtX_inv <- solve(crossprod(Xfull))
+  Omega_sim <- (p$rho)^abs(outer(weeks, weeks, "-"))
+  
+  rejections <- 0L
+  for (sim in seq_len(n_sim)) {
+    eps <- numeric(p$T_weeks)
+    eps[1] <- rnorm(1, 0, sigma_w)
+    for (t in 2:p$T_weeks) {
+      eps[t] <- p$rho * eps[t-1] + rnorm(1, 0, sigma_w * sqrt(1 - p$rho^2))
+    }
+    seasonal <- 0.02 * sin(2 * pi * weeks / 52)
+    y <- mde_slope * weeks + seasonal + eps
+    
+    fit <- lm.fit(Xfull, y)
+    coefs <- fit$coefficients
+    resids <- fit$residuals
+    sigma_hat <- sqrt(sum(resids^2) / df)
+    sandwich_se <- sigma_hat * sqrt(
+      (XtX_inv %*% crossprod(Xfull, Omega_sim %*% Xfull) %*% XtX_inv)[2, 2]
+    )
+    t_stat <- coefs[2] / sandwich_se
+    if (abs(t_stat) > qt(1 - alpha/2, df)) rejections <- rejections + 1L
+  }
+  
+  sim_results[[sc_i]] <- data.table(
+    `Weekly n`    = p$weekly_n,
+    `T (weeks)`   = p$T_weeks,
+    `rho`         = p$rho,
+    `sigma_txn`   = p$sigma_txn,
+    `sigma_week`  = p$sigma_week,
+    `Analytical MDE (%/yr)` = sprintf("%.1f%%",
+                                       100 * (exp(52 * mde_slope) - 1)),
+    `Empirical power` = sprintf("%.1f%%", 100 * rejections / n_sim),
+    `Target`      = "80%"
+  )
+}
+
+knitr::kable(rbindlist(sim_results),
+             caption = "Simulation validation: empirical power at the analytical MDE (1,000 replications)")
+```
+
+Empirical power is consistently near 80% (small upward bias is expected from
+the conservative sandwich formula), confirming the analytical MDE is correctly
+calibrated across the 2--5 year range.
+
+# Recommendations
+
+1. **Five years of data is a major advantage.** Compared to 2 years, the 5-year
+   window roughly halves the minimum-n requirements for trend detection. Many
+   categories that would be marginal at 2 years become adequate or well-powered
+   at 5 years.
+
+2. **Invest in a standardised price index.** The difference between raw
+   category means ($\sigma = 0.50$) and a fixed-weight index ($\sigma = 0.15$)
+   shifts a county-category cell from "marginal" to "well-powered." This is the
+   single highest-leverage methodological choice after time span.
+
+3. **Supercategory-level analysis is broadly viable; category-level is not.**
+   At supercategory level, most of the 20 NHANES-recommended picks are adequate
+   or better in large and mid-size counties. But at category level, the majority
+   of the 381 constituent categories are infeasible or underpowered in all but
+   the largest metro counties. County-level trend analysis at category
+   granularity is realistic only for the highest-volume categories (e.g. SOFT
+   DRINKS, COWS MILK, BREAD, CHICKEN EGGS, POTATOES, POTATO CHIP).
+
+4. **For category-level questions in smaller counties, aggregate or pool.**
+   Options include: (a) work at the supercategory level, (b) use a hierarchical
+   model that borrows strength across counties, or (c) group related categories
+   (e.g. all chip types into a single "chips" aggregate). This power analysis
+   assumes standalone county-by-county regressions -- the most conservative
+   framing.
+
+5. **When the actual county data arrives**, compute each county's average weekly
+   $n$ per category and look it up in the minimum-viable-n tables to get
+   immediate go/no-go verdicts. The category-level thinning tables in this
+   report identify which supercategories can support category-level work and
+   which cannot.
+
+# Technical notes
+
+- The sandwich variance $(X'X)^{-1} X' \Omega X (X'X)^{-1}$ is computed
+  exactly for each $(T, \rho)$ combination rather than using the
+  $\sqrt{(1+\rho)/(1-\rho)}$ approximation, which applies only to sample means
+  and substantially misestimates the OLS slope variance in the presence of
+  covariates.
+- The feasibility filter uses a Poisson model for zero-week probability: a cell
+  with expected weekly $n < 1.6$ will have $>23\%$ of weeks with no
+  transactions and is marked infeasible.
+- Verdict bands: **well-powered** (MDE < 2%/yr), **adequate** (2--5%),
+  **marginal** (5--10%), **underpowered** (> 10%). These are calibrated to US
+  grocery inflation norms (typically 2--4%/yr in non-crisis periods).
+- All code and output CSVs are in `analysis/`.
+
+```{r write-csv}
+out_dir <- file.path(here, "analysis")
+fwrite(grid, file.path(out_dir, "power_mde_county_trends.csv"))
+fwrite(min_n_table, file.path(out_dir, "power_min_viable_n.csv"))
+```
+
+---
+
+*Output files: `power_mde_county_trends.csv` (`r nrow(grid)` rows),
+`power_min_viable_n.csv` (`r nrow(min_n_table)` rows)*
