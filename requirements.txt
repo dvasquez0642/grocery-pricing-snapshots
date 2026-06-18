@@ -1,0 +1,11 @@
+# Dashboard dependencies (Streamlit Cloud reads this file)
+#
+# Scraping dependencies (selenium, playwright, AI APIs, etc.) are only
+# needed locally by the individual task groups under wayback grocery AO/,
+# each of which maintains its own requirements.txt.
+
+streamlit>=1.44.0,<1.50
+pandas>=2.0.0,<3.0
+numpy>=1.24.0,<3.0
+plotly>=5.18.0,<6.0
+pyarrow>=14.0.0
