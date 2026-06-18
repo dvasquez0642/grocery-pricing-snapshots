@@ -1,0 +1,173 @@
+category_number,broad_group,group_label
+1002,milk_dairy_drink,Milk whole
+1004,milk_dairy_drink,Milk reduced fat
+1006,milk_dairy_drink,Milk lowfat
+1008,milk_dairy_drink,Milk nonfat
+1202,milk_dairy_drink,Flavored milk whole
+1204,milk_dairy_drink,Flavored milk reduced fat
+1206,milk_dairy_drink,Flavored milk lowfat
+1208,milk_dairy_drink,Flavored milk nonfat
+1402,milk_dairy_drink,Milk shakes and other dairy drinks
+1602,cheese,Cheese
+1604,cheese,Cottage/ricotta cheese
+1820,yogurt,Yogurt regular
+1822,yogurt,Yogurt Greek
+1902,milk_dairy_drink,Plant-based milk
+1904,yogurt,Plant-based yogurt
+2002,meat_poultry,Beef excludes ground
+2004,meat_poultry,Ground beef
+2006,meat_poultry,Pork
+2008,meat_poultry,Lamb goat game
+2010,meat_poultry,Liver and organ meats
+2202,meat_poultry,Chicken whole pieces
+2204,meat_poultry,Chicken patties nuggets and tenders
+2206,meat_poultry,Turkey duck other poultry
+2402,seafood,Fish
+2404,seafood,Shellfish
+2502,eggs,Eggs and omelets
+2602,meat_poultry,Cold cuts and cured meats
+2604,breakfast_meat,Bacon
+2606,meat_poultry,Frankfurters
+2608,breakfast_meat,Sausages
+2802,beans_nuts,Beans peas legumes
+2804,beans_nuts,Nuts and seeds
+2806,beans_nuts,Soy and meat-alternative products
+3002,mixed_main,Meat mixed dishes
+3004,mixed_main,Poultry mixed dishes
+3006,mixed_main,Seafood mixed dishes
+3102,vegetables,Bean pea legume dishes
+3104,vegetables,Vegetable dishes
+3202,grain_starch,Rice mixed dishes
+3204,grain_starch,Pasta mixed dishes excludes macaroni and cheese
+3206,grain_starch,Macaroni and cheese
+3208,grain_starch,Turnovers and other grain-based items
+3402,mixed_main,Fried rice and lo/chow mein
+3404,mixed_main,Stir-fry and soy-based sauce mixtures
+3406,mixed_main,Egg rolls dumplings sushi
+3502,tortilla,Burritos and tacos
+3504,tortilla,Nachos
+3506,tortilla,Other Mexican mixed dishes
+3602,pizza,Pizza
+3702,sandwich,Burgers
+3703,sandwich,Frankfurter sandwiches
+3704,sandwich,Chicken fillet sandwiches
+3706,sandwich,Egg/breakfast sandwiches
+3720,sandwich,Cheese sandwiches
+3722,sandwich,Peanut butter and jelly sandwiches
+3730,sandwich,Seafood sandwiches
+3740,sandwich,Deli and cured meat sandwiches
+3742,sandwich,Meat and BBQ sandwiches
+3744,sandwich,Vegetable sandwiches/burgers
+3804,soup,Soups broth-based
+3806,soup,Soups cream-based
+3808,soup,Ramen and Asian broth-based soups
+4002,grain_starch,Rice
+4004,grain_starch,Pasta noodles cooked grains
+4202,bread,Yeast breads
+4204,bread,Rolls and buns
+4206,bread,Bagels and English muffins
+4208,bread,Tortillas
+4402,bread,Biscuits muffins quick breads
+4404,bread,Pancakes waffles French toast
+4602,cereal_oatmeal,Ready-to-eat cereal higher sugar
+4604,cereal_oatmeal,Ready-to-eat cereal lower sugar
+4802,cereal_oatmeal,Oatmeal
+4804,cereal_oatmeal,Grits and other cooked cereals
+5002,salty_snack,Potato chips
+5004,salty_snack,Tortilla corn other chips
+5006,salty_snack,Popcorn
+5008,salty_snack,Pretzels/snack mix
+5202,salty_snack,Crackers excludes saltines
+5204,salty_snack,Saltine crackers
+5402,sweet_baked,Cereal bars
+5404,sweet_baked,Nutrition bars
+5502,sweet_baked,Cakes and pies
+5504,sweet_baked,Cookies and brownies
+5506,sweet_baked,Doughnuts sweet rolls pastries
+5702,sweet_baked,Candy containing chocolate
+5704,sweet_baked,Candy not containing chocolate
+5802,sweet_baked,Ice cream and frozen dairy desserts
+5804,sweet_baked,Pudding
+5806,sweet_baked,Gelatins ices sorbets
+6002,fruit,Apples
+6004,fruit,Bananas
+6006,fruit,Grapes
+6008,fruit,Peaches and nectarines
+6009,fruit,Strawberries
+6011,fruit,Blueberries and other berries
+6012,fruit,Citrus fruits
+6014,fruit,Melons
+6016,fruit,Dried fruits
+6018,fruit,Other fruits and fruit salads
+6020,fruit,Pears
+6022,fruit,Pineapple
+6024,fruit,Mango and papaya
+6402,vegetables,Tomatoes
+6404,vegetables,Carrots
+6406,vegetables,Other red and orange vegetables
+6407,vegetables,Broccoli
+6409,vegetables,Spinach
+6410,vegetables,Lettuce and lettuce salads
+6411,vegetables,Other dark green vegetables
+6412,vegetables,String beans
+6413,vegetables,Cabbage
+6414,vegetables,Onions
+6416,vegetables,Corn
+6418,vegetables,Other starchy vegetables
+6420,vegetables,Other vegetables and combinations
+6430,vegetables,Fried vegetables
+6432,vegetables,Coleslaw non-lettuce salads
+6489,vegetables,Vegetables on a sandwich
+6802,grain_starch,White potatoes baked or boiled
+6804,grain_starch,French fries and other fried white potatoes
+6806,grain_starch,Mashed potatoes and white potato mixtures
+7002,juice_smoothie,Citrus juice
+7004,juice_smoothie,Apple juice
+7006,juice_smoothie,Other fruit juice
+7008,juice_smoothie,Vegetable juice
+7102,sweet_drink,Diet soft drinks
+7104,sweet_drink,Diet sport and energy drinks
+7106,sweet_drink,Other diet drinks
+7202,sweet_drink,Soft drinks
+7204,sweet_drink,Fruit drinks
+7206,sweet_drink,Sport and energy drinks
+7208,sweet_drink,Nutritional beverages
+7220,sweet_drink,Smoothies and grain drinks
+7302,coffee_tea,Coffee
+7304,coffee_tea,Tea
+7502,alcohol,Beer
+7504,alcohol,Wine
+7506,alcohol,Liquor and cocktails
+7702,water,Tap water
+7704,water,Bottled water
+7802,water,Flavored or carbonated water
+7804,water,Enhanced water
+8002,condiment_fat,Butter and animal fats
+8004,condiment_fat,Margarine
+8006,condiment_fat,Cream cheese sour cream whipped cream
+8008,condiment_fat,Cream and cream substitutes
+8010,condiment_fat,Mayonnaise
+8012,condiment_fat,Salad dressings and vegetable oils
+8402,condiment_fat,Tomato-based condiments
+8404,condiment_fat,Soy-based condiments
+8406,condiment_fat,Mustard and other condiments
+8408,condiment_fat,Olives pickles pickled vegetables
+8410,condiment_fat,Pasta sauces tomato-based
+8412,condiment_fat,Dips gravies other sauces
+8802,condiment_fat,Sugars and honey
+8804,condiment_fat,Sugar substitutes
+8806,condiment_fat,Jams syrups toppings
+9002,baby_food,Baby food cereals
+9004,baby_food,Baby food fruit
+9006,baby_food,Baby food vegetables
+9007,baby_food,Baby food mixtures
+9008,baby_food,Baby food meat and dinners
+9010,baby_food,Baby food yogurt
+9012,baby_food,Baby food snacks and sweets
+9202,baby_food,Baby juice
+9204,baby_food,Baby water
+9402,baby_food,Formula ready-to-feed
+9404,baby_food,Formula prepared from powder
+9602,baby_food,Human milk
+9802,other,Protein and nutritional powders
+9999,other,Not included in a food category

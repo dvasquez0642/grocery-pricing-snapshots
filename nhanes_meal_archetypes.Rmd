@@ -1,0 +1,1109 @@
+---
+title: "NHANES Meal Archetypes"
+subtitle: "August 2021-August 2023 WWEIA / NHANES first-pass meal taxonomy"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+root_dir <- getwd()
+
+if (!file.exists(file.path(root_dir, "scripts", "run-r.sh"))) {
+  candidate_root <- normalizePath(file.path(root_dir, "..", ".."), winslash = "/", mustWork = FALSE)
+  if (file.exists(file.path(candidate_root, "scripts", "run-r.sh"))) {
+    root_dir <- candidate_root
+  } else {
+    stop("Run this document from the repo root or from analysis/nhanes.", call. = FALSE)
+  }
+}
+
+local_lib <- file.path(root_dir, "lib")
+dir.create(local_lib, showWarnings = FALSE, recursive = TRUE)
+.libPaths(c(normalizePath(local_lib, winslash = "/", mustWork = TRUE), .libPaths()))
+
+required_packages <- c(
+  "dplyr",
+  "ggplot2",
+  "haven",
+  "knitr",
+  "purrr",
+  "readxl",
+  "rmarkdown",
+  "scales",
+  "stringr",
+  "tibble",
+  "tidyr"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    paste(
+      "Install the required packages into the project lib folder before knitting:",
+      sprintf(
+        "install.packages(c(%s), lib = %s)",
+        paste(sprintf("'%s'", missing_packages), collapse = ", "),
+        shQuote(local_lib)
+      )
+    ),
+    call. = FALSE
+  )
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 4.5
+)
+
+options(dplyr.summarise.inform = FALSE)
+
+render_table <- function(data, caption = NULL, digits = NULL) {
+  args <- list(
+    x = data,
+    format = "html",
+    caption = caption,
+    table.attr = 'class="table table-striped table-bordered table-hover table-condensed" style="width:auto; margin-bottom: 22px;"'
+  )
+  if (!is.null(digits)) {
+    args$digits <- digits
+  }
+  do.call(knitr::kable, args)
+}
+
+out_dir <- file.path(root_dir, "analysis", "nhanes")
+raw_dir <- file.path(out_dir, "raw")
+dir.create(raw_dir, showWarnings = FALSE, recursive = TRUE)
+
+urls <- list(
+  demo = "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles/DEMO_L.XPT",
+  dr1iff = "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles/DR1IFF_L.XPT",
+  drxfd = "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles/DRXFCD_L.XPT",
+  foodcat = "https://www.ars.usda.gov/ARSUserFiles/80400530/apps/WWEIA_August2021_August2023_foodcat_FNDDS.xlsx"
+)
+
+occasion_map <- c(
+  `1` = "breakfast",
+  `5` = "breakfast",
+  `10` = "breakfast",
+  `2` = "lunch",
+  `11` = "lunch",
+  `3` = "dinner",
+  `4` = "dinner",
+  `12` = "dinner",
+  `14` = "dinner",
+  `6` = "snack",
+  `13` = "snack",
+  `15` = "snack",
+  `16` = "snack",
+  `17` = "snack",
+  `18` = "snack",
+  `7` = "beverage",
+  `19` = "beverage",
+  `8` = "other",
+  `9` = "other",
+  `91` = "other"
+)
+
+combo_map <- c(
+  `1` = "drink_additions",
+  `2` = "cereal_combo",
+  `3` = "bread_combo",
+  `4` = "salad_combo",
+  `5` = "sandwich_combo",
+  `6` = "soup_combo",
+  `7` = "frozen_meal_combo",
+  `8` = "ice_cream_combo",
+  `9` = "beans_veg_combo",
+  `10` = "fruit_combo",
+  `11` = "tortilla_combo",
+  `12` = "protein_combo",
+  `13` = "lunchables_combo",
+  `14` = "chips_combo",
+  `15` = "baby_combo",
+  `90` = "mixed_combo"
+)
+
+group_patterns <- tibble::tribble(
+  ~group, ~pattern,
+  "coffee_tea", "coffee|tea",
+  "water", "\\bwater\\b",
+  "alcohol", "beer|wine|liquor|alcohol|cocktail",
+  "sweet_drink", "soft drinks|sports.*drink|energy drink|sweetened beverage|fruit drink|fruit ades|sports beverage",
+  "juice_smoothie", "juice|smoothie",
+  "pizza", "pizza",
+  "tortilla", "taco|burrito|quesadilla|enchilada|tortilla|mexican mixed dishes",
+  "sandwich", "sandwich|burger|hot dog|slider",
+  "salad", "salad",
+  "soup", "soup",
+  "eggs", "egg|omelet|omelette",
+  "cereal_oatmeal", "cereal|oatmeal|grits",
+  "yogurt", "yogurt",
+  "milk_dairy_drink", "milk|milk shakes|dairy drinks|plant-based milk",
+  "cheese", "cheese",
+  "sweet_baked", "sweet bakery|cakes|cookies|pies|doughnuts|pastries|croissants|muffins|ice cream|frozen dairy desserts|candy|chocolate|dessert|brownies|sweet rolls|snack bars",
+  "bread", "bread|rolls|bagels|english muffins|biscuits|toast|quick breads|pancakes|waffles|french toast",
+  "breakfast_meat", "bacon|sausage|ham",
+  "seafood", "fish|shellfish|seafood",
+  "meat_poultry", "beef|pork|chicken|turkey|lamb|goat|meat|organ meats|deli meat|frankfurter|meat mixed dishes",
+  "beans_nuts", "beans|legumes|lentils|nuts|seeds|peanut butter|nut butter",
+  "grain_starch", "pasta|rice|noodles|macaroni|grains|grain dishes|potatoes|fried potatoes|starchy vegetables|corn",
+  "fruit", "fruit|apples|bananas|berries|citrus|grapes|melon|peaches|pears|pineapple|raisins|applesauce",
+  "vegetables", "vegetables|vegetable mixed dishes|greens|broccoli|carrots|tomatoes|lettuce|beans, peas|peas and carrots|other vegetables",
+  "salty_snack", "chips|crackers|pretzels|popcorn|snack",
+  "mixed_main", "mixed dishes|casseroles|stir fry|fried rice|lo mein|macaroni and cheese|frozen meals|asian mixed dishes|italian mixed dishes"
+)
+
+download_if_needed <- function(url, path) {
+  if (!file.exists(path)) {
+    download.file(url, path, mode = "wb", quiet = TRUE)
+  }
+  path
+}
+
+clean_numeric <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  x[!is.na(x) & abs(x) < 1e-20] <- 0
+  x
+}
+
+normalize_occasion <- function(x) {
+  key <- as.character(as.integer(x))
+  dplyr::coalesce(unname(occasion_map[key]), "other")
+}
+
+category_group_lookup <- readr::read_csv(
+  file.path(out_dir, "category_group_lookup.csv"),
+  col_types = readr::cols(
+    category_number = readr::col_integer(),
+    broad_group = readr::col_character(),
+    group_label = readr::col_character()
+  )
+)
+category_group_map <- setNames(
+  category_group_lookup$broad_group,
+  as.character(category_group_lookup$category_number)
+)
+
+food_group_by_category_number <- function(cat_num) {
+  key <- as.character(as.integer(round(cat_num)))
+  result <- unname(category_group_map[key])
+  dplyr::coalesce(result, "other")
+}
+
+food_group <- function(category_description) {
+  # Legacy regex-based classifier, kept for reference.
+  text <- tolower(dplyr::coalesce(category_description, ""))
+  match_index <- purrr::detect_index(group_patterns$pattern, ~ stringr::str_detect(text, .x))
+  if (match_index == 0) "other" else group_patterns$group[[match_index]]
+}
+
+compact_list <- function(text, limit = 4) {
+  if (length(text) == 0 || is.na(text) || text == "") {
+    return("-")
+  }
+  parts <- trimws(unlist(strsplit(text, ",", fixed = TRUE)))
+  parts <- parts[parts != ""]
+  parts <- unique(parts)
+  if (length(parts) == 0) return("-")
+  paste(head(parts, limit), collapse = ", ")
+}
+
+stratum_label <- function(name) {
+  dplyr::recode(
+    name,
+    all = "All Respondents",
+    pir_3plus = "Higher SES (PIR >= 3)",
+    pir_5plus = "Highest SES (PIR >= 5)",
+    pir_lt_1_3 = "Lower SES (PIR < 1.3)",
+    .default = name
+  )
+}
+
+build_label <- function(occasion, groups, combos) {
+  groups <- unlist(groups)
+  combos <- unlist(combos)
+
+  if (occasion == "breakfast") {
+    if ("cereal_combo" %in% combos || "cereal_oatmeal" %in% groups) return("cereal or oatmeal breakfast")
+    if ("sandwich_combo" %in% combos || "sandwich" %in% groups || ("tortilla_combo" %in% combos && any(c("eggs", "meat_poultry") %in% groups))) return("breakfast sandwich or burrito")
+    if ("eggs" %in% groups && any(c("bread", "breakfast_meat") %in% groups)) return("eggs with bread or meat")
+    if ("coffee_tea" %in% groups && any(c("sweet_baked", "bread") %in% groups)) return("coffee and pastry breakfast")
+    if (all(c("yogurt", "fruit") %in% groups)) return("yogurt and fruit breakfast")
+    if (all(c("fruit", "bread") %in% groups)) return("fruit and bread breakfast")
+    if ("coffee_tea" %in% groups) return("coffee-first breakfast")
+    return("other breakfast")
+  }
+
+  if (occasion == "lunch") {
+    if ("sandwich_combo" %in% combos || "sandwich" %in% groups) return("sandwich lunch")
+    if ("salad_combo" %in% combos || "salad" %in% groups) return("salad lunch")
+    if ("soup_combo" %in% combos || "soup" %in% groups) return("soup lunch")
+    if ("tortilla_combo" %in% combos || "tortilla" %in% groups) return("tortilla lunch")
+    if ("pizza" %in% groups) return("pizza lunch")
+    if (length(intersect(c("meat_poultry", "seafood"), groups)) > 0 && length(intersect(c("grain_starch", "vegetables"), groups)) > 0) return("plate lunch")
+    if ("mixed_main" %in% groups || "mixed_combo" %in% combos) return("mixed entree lunch")
+    return("other lunch")
+  }
+
+  if (occasion == "dinner") {
+    if ("tortilla_combo" %in% combos || "tortilla" %in% groups) return("tortilla dinner")
+    if ("pizza" %in% groups) return("pizza dinner")
+    if ("soup_combo" %in% combos || "soup" %in% groups) return("soup dinner")
+    if (length(intersect(c("meat_poultry", "seafood", "beans_nuts"), groups)) > 0 && all(c("grain_starch", "vegetables") %in% groups)) return("protein vegetable starch dinner")
+    if (length(intersect(c("meat_poultry", "seafood", "beans_nuts"), groups)) > 0 && "grain_starch" %in% groups) return("protein and starch dinner")
+    if ("mixed_main" %in% groups || any(c("mixed_combo", "frozen_meal_combo") %in% combos)) return("mixed entree dinner")
+    if ("sandwich_combo" %in% combos || "sandwich" %in% groups) return("sandwich dinner")
+    return("other dinner")
+  }
+
+  if (occasion == "snack") {
+    if ("chips_combo" %in% combos || "salty_snack" %in% groups) return("salty snack")
+    if ("sweet_baked" %in% groups) return("sweet snack")
+    if ("fruit" %in% groups && any(c("yogurt", "cheese") %in% groups)) return("fruit and dairy snack")
+    if ("sandwich_combo" %in% combos || "sandwich" %in% groups) return("sandwich snack")
+    if ("coffee_tea" %in% groups) return("coffee or tea snack")
+    return("other snack")
+  }
+
+  "other occasion"
+}
+
+build_strata <- function(df) {
+  list(
+    all = rep(TRUE, nrow(df)),
+    pir_3plus = df$INDFMPIR >= 3,
+    pir_5plus = df$INDFMPIR >= 5,
+    pir_lt_1_3 = df$INDFMPIR < 1.3
+  )
+}
+
+top_items <- function(x, limit = 4) {
+  counts <- sort(table(x), decreasing = TRUE)
+  paste(head(names(counts), limit), collapse = ", ")
+}
+
+load_inputs <- function() {
+  demo_path <- download_if_needed(urls$demo, file.path(raw_dir, "demo.xpt"))
+  dr1_path <- download_if_needed(urls$dr1iff, file.path(raw_dir, "dr1iff.xpt"))
+  drxfd_path <- download_if_needed(urls$drxfd, file.path(raw_dir, "drxfd.xpt"))
+  foodcat_path <- download_if_needed(urls$foodcat, file.path(raw_dir, "food_categories.xlsx"))
+
+  list(
+    demo = haven::read_xpt(demo_path),
+    dr1 = haven::read_xpt(dr1_path),
+    drxfd = haven::read_xpt(drxfd_path),
+    foodcat = readxl::read_excel(foodcat_path, sheet = "Aug2021-Aug2023_FNDDS_foodcat")
+  )
+}
+
+prepare_data <- function() {
+  inputs <- load_inputs()
+  demo <- inputs$demo
+  dr1 <- inputs$dr1
+  drxfd <- inputs$drxfd
+  foodcat <- inputs$foodcat
+
+  demo <- demo %>%
+    mutate(
+      SEQN = as.integer(clean_numeric(SEQN)),
+      INDFMPIR = clean_numeric(INDFMPIR),
+      RIDAGEYR = clean_numeric(RIDAGEYR)
+    )
+
+  use_cols <- c("SEQN", "WTDRD1", "DR1_020", "DR1_030Z", "DR1CCMTX", "DR1IFDCD", "DR1IKCAL", "DR1FS", "DR1_040Z")
+
+  dr1 <- dr1 %>%
+    select(all_of(use_cols)) %>%
+    mutate(across(all_of(use_cols), clean_numeric)) %>%
+    mutate(
+      SEQN = as.integer(SEQN),
+      food_code = as.integer(round(DR1IFDCD)),
+      occasion = vapply(DR1_030Z, normalize_occasion, character(1))
+    ) %>%
+    filter(occasion %in% c("breakfast", "lunch", "dinner", "snack"))
+
+  foodcat <- foodcat %>%
+    mutate(food_code = as.integer(round(clean_numeric(food_code)))) %>%
+    select(food_code, category_number, category_description)
+
+  drxfd <- drxfd %>%
+    mutate(
+      food_code = as.integer(round(clean_numeric(DRXFDCD))),
+      food_description = DRXFCLD
+    ) %>%
+    select(food_code, food_description)
+
+  participants <- demo %>%
+    filter(!is.na(SEQN)) %>%
+    select(SEQN, INDFMPIR, RIDAGEYR)
+
+  dr1 <- dr1 %>%
+    left_join(foodcat, by = "food_code") %>%
+    left_join(drxfd, by = "food_code") %>%
+    mutate(
+      category_description = dplyr::coalesce(category_description, food_description),
+      broad_group = vapply(category_number, food_group_by_category_number, character(1)),
+      combo_name = dplyr::coalesce(unname(combo_map[as.character(as.integer(round(DR1CCMTX)))]), "none")
+    ) %>%
+    left_join(participants, by = "SEQN") %>%
+    mutate(meal_key = paste(SEQN, as.integer(round(DR1_020)), occasion, sep = "|"))
+
+  meal_base <- dr1 %>%
+    group_by(meal_key) %>%
+    summarise(
+      SEQN = first(SEQN),
+      occasion = first(occasion),
+      meal_time = first(DR1_020),
+      weight = first(WTDRD1),
+      total_kcal = sum(DR1IKCAL, na.rm = TRUE),
+      pir = first(INDFMPIR),
+      age = first(RIDAGEYR),
+      .groups = "drop"
+    )
+
+  group_summary <- dr1 %>%
+    group_by(meal_key, broad_group) %>%
+    summarise(group_kcal = sum(DR1IKCAL, na.rm = TRUE), group_items = n(), .groups = "drop") %>%
+    filter(broad_group != "other") %>%
+    arrange(meal_key, desc(group_kcal), desc(group_items), broad_group) %>%
+    group_by(meal_key) %>%
+    summarise(
+      top_groups = paste(head(broad_group, 4), collapse = ", "),
+      group_set = list(sort(unique(broad_group))),
+      .groups = "drop"
+    )
+
+  combo_summary <- dr1 %>%
+    filter(combo_name != "none") %>%
+    group_by(meal_key) %>%
+    summarise(combo_set = list(sort(unique(combo_name))), .groups = "drop")
+
+  category_summary <- dr1 %>%
+    group_by(meal_key, category_description) %>%
+    summarise(cat_kcal = sum(DR1IKCAL, na.rm = TRUE), .groups = "drop") %>%
+    arrange(meal_key, desc(cat_kcal), category_description) %>%
+    group_by(meal_key) %>%
+    summarise(top_categories = paste(head(category_description, 5), collapse = ", "), .groups = "drop")
+
+  meals <- meal_base %>%
+    left_join(group_summary, by = "meal_key") %>%
+    left_join(combo_summary, by = "meal_key") %>%
+    left_join(category_summary, by = "meal_key") %>%
+    mutate(
+      group_set = purrr::map(group_set, ~ if (is.null(.x)) character() else .x),
+      combo_set = purrr::map(combo_set, ~ if (is.null(.x)) character() else .x),
+      top_groups = dplyr::coalesce(top_groups, ""),
+      top_categories = dplyr::coalesce(top_categories, ""),
+      archetype = purrr::pmap_chr(list(occasion, group_set, combo_set), build_label)
+    )
+
+  list(raw = dr1, meals = meals, demo = demo, foodcat = foodcat, drxfd = drxfd)
+}
+
+summarize_meals <- function(meals) {
+  participant_frame <- meals %>% distinct(SEQN, pir, age)
+  participant_strata <- participant_frame %>% mutate(INDFMPIR = pir)
+  meal_strata_frame <- meals %>% mutate(INDFMPIR = pir)
+
+  participant_rows <- purrr::imap_dfr(build_strata(participant_strata), function(mask, name) {
+    subset <- participant_frame[mask %in% TRUE & !is.na(mask), , drop = FALSE]
+    tibble(
+      stratum = name,
+      participants = dplyr::n_distinct(subset$SEQN),
+      mean_age = round(mean(subset$age, na.rm = TRUE), 1)
+    )
+  })
+
+  summary_rows <- purrr::imap_dfr(build_strata(meal_strata_frame), function(mask, name) {
+    subset <- meals[mask %in% TRUE & !is.na(mask), , drop = FALSE]
+    if (nrow(subset) == 0) return(tibble())
+
+    occasion_totals <- subset %>%
+      group_by(occasion) %>%
+      summarise(occasion_weight = sum(weight, na.rm = TRUE), .groups = "drop")
+
+    subset %>%
+      group_by(occasion, archetype) %>%
+      summarise(
+        weighted_meals = sum(weight, na.rm = TRUE),
+        unweighted_meals = dplyr::n_distinct(meal_key),
+        participants = dplyr::n_distinct(SEQN),
+        top_groups = top_items(top_groups),
+        top_categories = top_items(top_categories),
+        .groups = "drop"
+      ) %>%
+      left_join(occasion_totals, by = "occasion") %>%
+      mutate(
+        weighted_share = weighted_meals / occasion_weight,
+        stratum = name
+      )
+  }) %>%
+    arrange(stratum, occasion, desc(weighted_meals))
+
+  list(participants = participant_rows, summary = summary_rows)
+}
+
+analysis <- prepare_data()
+summary_objects <- summarize_meals(analysis$meals)
+
+participants <- summary_objects$participants
+summary_table <- summary_objects$summary
+raw_foods <- analysis$raw
+meals <- analysis$meals
+demo <- analysis$demo
+foodcat <- analysis$foodcat
+drxfd <- analysis$drxfd
+```
+
+## NHANES provides a practical starting point for a U.S. meal universe
+
+This report uses public NHANES / WWEIA food-intake files for August 2021 through August 2023 to build a first-pass meal taxonomy from Day 1 dietary recall data. It establishes an evidence-based view of what Americans actually eat, then compares how those meal patterns vary by income.
+
+That makes the output useful as a screening tool for later mapping into NiQ supercategories. In practical terms, the analysis answers a narrower but decision-relevant question: which meal archetypes are common enough, and stable enough across income groups, to anchor a grocery basket strategy.
+
+The analysis draws on four public NHANES/WWEIA files: demographics, Day 1 individual foods, food-code descriptions, and USDA food-category mapping.
+
+Meals are collapsed into meal events and then assigned archetypes using a transparent rules-based heuristic. The unit of analysis is one respondent, one day, one eating occasion; meals are weighted with `WTDRD1` and stratified by income-to-poverty ratio. Source-file details, derivation steps, and design rationale are in the [Appendix](#appendix-reusable-outputs-and-data-dictionary).
+
+## The underlying sample is large enough for directional SES comparisons
+
+
+The four source files yield 88,006 food rows across 6,679 respondents, which collapse into 28,890 meal events (mean 425 kcal per meal). Detailed file-level row counts and calorie distributions are in the [Appendix](#appendix-reusable-outputs-and-data-dictionary).
+
+
+### Income strata are large enough for directional reads
+
+This table shows the sample sizes for the income groups used later in the report. It is mainly a coverage check: before interpreting high-SES or low-SES meal patterns, it is useful to know how many respondents are contributing to each slice and whether the age mix differs materially across them.
+
+```{r strata-table, echo=FALSE}
+participants_display <- participants %>%
+  mutate(group = stratum_label(stratum)) %>%
+  select(group, participants, mean_age)
+
+render_table(participants_display, digits = 1)
+```
+
+### Snacks and dinners account for most weighted meal volume
+
+The plot below shows the overall meal mix before any archetype labeling. Snacks account for the largest share of weighted meal events; dinners are second. A detailed occasion-level table is in the [Appendix](#appendix-reusable-outputs-and-data-dictionary).
+
+```{r occasion-data, echo=FALSE}
+occasion_distribution <- meals %>%
+  group_by(occasion) %>%
+  summarise(
+    unweighted_meals = dplyr::n(),
+    weighted_meals = sum(weight, na.rm = TRUE),
+    avg_kcal = mean(total_kcal, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(weighted_share = weighted_meals / sum(weighted_meals))
+```
+
+```{r occasion-plot, echo=FALSE}
+ggplot2::ggplot(occasion_distribution, ggplot2::aes(x = occasion, y = weighted_meals / 1e6, fill = occasion)) +
+  ggplot2::geom_col(show.legend = FALSE) +
+  ggplot2::labs(
+    title = "Weighted meal volume by occasion",
+    x = NULL,
+    y = "Weighted meals (millions)"
+  ) +
+  ggplot2::theme_minimal(base_size = 12)
+```
+
+## A simple rules-based taxonomy captures the major meal families
+
+Meals are grouped into broad archetypes using two signals:
+
+- food-group presence, inferred from USDA food-category descriptions
+- USDA combination codes, which flag cases such as sandwiches, salads, cereal combinations, soups, and tortilla-based combinations
+
+The current taxonomy is deliberately simple. It is meant to identify broad meal families like `cereal or oatmeal breakfast`, `sandwich lunch`, `tortilla dinner`, or `sweet snack`. The tradeoff is that residual `other` buckets are still large, especially for dinner, but the gain is a framework that is intuitive enough to communicate and refine quickly.
+
+### A worked example shows how item-level foods become a meal archetype
+
+The example below traces one eating occasion from individual reported foods to the final meal label. This is the central analytical move in the document: multiple food rows are grouped into one meal event, broad food groups are inferred from USDA descriptions, and then the meal is assigned an archetype using a transparent sequence of rules.
+
+```{r worked-example, echo=FALSE, results='asis'}
+example_meal_key <- meals %>%
+  filter(archetype == "sandwich lunch") %>%
+  slice_head(n = 1) %>%
+  pull(meal_key)
+
+example_items <- raw_foods %>%
+  filter(meal_key == example_meal_key) %>%
+  select(SEQN, DR1_020, occasion, category_description, broad_group, DR1IKCAL) %>%
+  rename(
+    time_code = DR1_020,
+    food_category = category_description,
+    food_group = broad_group,
+    kcal = DR1IKCAL
+  )
+
+example_meal <- meals %>%
+  filter(meal_key == example_meal_key) %>%
+  select(meal_key, SEQN, occasion, total_kcal, pir, top_groups, top_categories, archetype)
+
+print(render_table(example_items, caption = "Item-level foods that make up one example meal"))
+print(render_table(example_meal, caption = "The corresponding derived meal row"))
+```
+
+In this example, the raw food items are first translated into broader meal components such as `sandwich`, `water`, or `sweet_drink`. Those components are then evaluated in a simple hierarchy of rules. Because the eating occasion is lunch and the grouped foods clearly signal a sandwich format, the meal is classified as `sandwich lunch`.
+
+That same logic is applied across the full meal file. The resulting archetypes are therefore best understood as standardized summaries of reported eating occasions rather than ad hoc labels assigned case by case.
+
+```{r archetype-functions, eval=FALSE}
+build_label <- function(occasion, groups, combos) {
+  groups <- unlist(groups)
+  combos <- unlist(combos)
+
+  if (occasion == "breakfast") {
+    if ("cereal_combo" %in% combos || "cereal_oatmeal" %in% groups) return("cereal or oatmeal breakfast")
+    if ("sandwich_combo" %in% combos || "sandwich" %in% groups || ("tortilla_combo" %in% combos && any(c("eggs", "meat_poultry") %in% groups))) return("breakfast sandwich or burrito")
+    if ("eggs" %in% groups && any(c("bread", "breakfast_meat") %in% groups)) return("eggs with bread or meat")
+    if ("coffee_tea" %in% groups && any(c("sweet_baked", "bread") %in% groups)) return("coffee and pastry breakfast")
+    if (all(c("yogurt", "fruit") %in% groups)) return("yogurt and fruit breakfast")
+    if (all(c("fruit", "bread") %in% groups)) return("fruit and bread breakfast")
+    if ("coffee_tea" %in% groups) return("coffee-first breakfast")
+    return("other breakfast")
+  }
+
+  if (occasion == "lunch") {
+    if ("sandwich_combo" %in% combos || "sandwich" %in% groups) return("sandwich lunch")
+    if ("salad_combo" %in% combos || "salad" %in% groups) return("salad lunch")
+    if ("soup_combo" %in% combos || "soup" %in% groups) return("soup lunch")
+    if ("tortilla_combo" %in% combos || "tortilla" %in% groups) return("tortilla lunch")
+    if ("pizza" %in% groups) return("pizza lunch")
+    if (length(intersect(c("meat_poultry", "seafood"), groups)) > 0 && length(intersect(c("grain_starch", "vegetables"), groups)) > 0) return("plate lunch")
+    if ("mixed_main" %in% groups || "mixed_combo" %in% combos) return("mixed entree lunch")
+    return("other lunch")
+  }
+
+  if (occasion == "dinner") {
+    if ("tortilla_combo" %in% combos || "tortilla" %in% groups) return("tortilla dinner")
+    if ("pizza" %in% groups) return("pizza dinner")
+    if ("soup_combo" %in% combos || "soup" %in% groups) return("soup dinner")
+    if (length(intersect(c("meat_poultry", "seafood", "beans_nuts"), groups)) > 0 && all(c("grain_starch", "vegetables") %in% groups)) return("protein vegetable starch dinner")
+    if (length(intersect(c("meat_poultry", "seafood", "beans_nuts"), groups)) > 0 && "grain_starch" %in% groups) return("protein and starch dinner")
+    if ("mixed_main" %in% groups || any(c("mixed_combo", "frozen_meal_combo") %in% combos)) return("mixed entree dinner")
+    if ("sandwich_combo" %in% combos || "sandwich" %in% groups) return("sandwich dinner")
+    return("other dinner")
+  }
+
+  if (occasion == "snack") {
+    if ("chips_combo" %in% combos || "salty_snack" %in% groups) return("salty snack")
+    if ("sweet_baked" %in% groups) return("sweet snack")
+    if ("fruit" %in% groups && any(c("yogurt", "cheese") %in% groups)) return("fruit and dairy snack")
+    if ("sandwich_combo" %in% combos || "sandwich" %in% groups) return("sandwich snack")
+    if ("coffee_tea" %in% groups) return("coffee or tea snack")
+    return("other snack")
+  }
+
+  "other occasion"
+}
+```
+
+## The leading archetypes are intuitive enough to inform category selection
+
+```{r helper-tables}
+top_archetypes <- function(summary_df, stratum_name, occasion_name, n = 5) {
+  summary_df %>%
+    filter(stratum == stratum_name, occasion == occasion_name) %>%
+    slice_head(n = n) %>%
+    transmute(
+      archetype,
+      weighted_share = scales::percent(weighted_share, accuracy = 0.1),
+      participants,
+      typical_groups = vapply(top_groups, compact_list, character(1), limit = 4),
+      typical_foods = vapply(top_categories, compact_list, character(1), limit = 4)
+    )
+}
+```
+
+### The mainstream meal set is anchored by a small number of repeatable patterns
+
+#### Breakfast splits across cereal, coffee-led, and convenience formats
+
+```{r all-breakfast, echo=FALSE}
+render_table(top_archetypes(summary_table, "all", "breakfast"))
+```
+
+#### Lunch remains sandwich-led, with salads and plate meals forming the next tier
+
+```{r all-lunch, echo=FALSE}
+render_table(top_archetypes(summary_table, "all", "lunch"))
+```
+
+#### Dinner is more fragmented, with sandwiches, tortillas, and mixed entrees all material
+
+```{r all-dinner, echo=FALSE}
+render_table(top_archetypes(summary_table, "all", "dinner"))
+```
+
+#### Snacks are concentrated in sweet, salty, and residual grab-and-go occasions
+
+```{r all-snack, echo=FALSE}
+render_table(top_archetypes(summary_table, "all", "snack"))
+```
+
+### Higher-income households skew toward coffee-led breakfasts and more composed lunches
+
+The next tables focus on the income slices most relevant for the less-budget-constrained meal universe question. Their value is in identifying which meal formats become more prominent when budget pressure is likely to be lower.
+
+#### High-income breakfasts skew more heavily toward coffee and cereal
+
+```{r high-breakfast, echo=FALSE}
+render_table(top_archetypes(summary_table, "pir_5plus", "breakfast"))
+```
+
+#### High-income lunches still center on sandwiches but shift up toward salads and mixed entrees
+
+```{r high-lunch, echo=FALSE}
+render_table(top_archetypes(summary_table, "pir_5plus", "lunch"))
+```
+
+#### High-income dinners diversify away from tortilla formats and toward mixed entrees
+
+```{r high-dinner, echo=FALSE}
+render_table(top_archetypes(summary_table, "pir_5plus", "dinner"))
+```
+
+#### High-income snacks look broadly similar, with a modest tilt toward coffee occasions
+
+```{r high-snack, echo=FALSE}
+render_table(top_archetypes(summary_table, "pir_5plus", "snack"))
+```
+
+### The clearest SES differences appear in dinner format rather than in snacking behavior
+
+```{r comparison-table, echo=FALSE}
+comparison_table <- bind_rows(
+  summary_table %>% filter(stratum == "pir_5plus") %>% mutate(group = "Highest SES (PIR >= 5)"),
+  summary_table %>% filter(stratum == "pir_lt_1_3") %>% mutate(group = "Lower SES (PIR < 1.3)")
+) %>%
+  group_by(group, occasion) %>%
+  slice_max(order_by = weighted_share, n = 3, with_ties = FALSE) %>%
+  ungroup() %>%
+  transmute(
+    group,
+    occasion,
+    archetype,
+    weighted_share = scales::percent(weighted_share, accuracy = 0.1),
+    participants
+  )
+
+render_table(comparison_table)
+```
+
+```{r comparison-plot, echo=FALSE}
+comparison_plot_data <- summary_table %>%
+  filter(stratum %in% c("pir_5plus", "pir_lt_1_3")) %>%
+  group_by(stratum, occasion) %>%
+  slice_max(order_by = weighted_share, n = 4, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(stratum = factor(stratum_label(stratum), levels = c("Highest SES (PIR >= 5)", "Lower SES (PIR < 1.3)")))
+
+ggplot2::ggplot(comparison_plot_data, ggplot2::aes(x = reorder(archetype, weighted_share), y = weighted_share, fill = stratum)) +
+  ggplot2::geom_col(position = "dodge") +
+  ggplot2::coord_flip() +
+  ggplot2::facet_wrap(~ occasion, scales = "free_y") +
+  ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  ggplot2::labs(
+    title = "Top meal archetypes in highest- and lowest-SES groups",
+    x = NULL,
+    y = "Weighted share",
+    fill = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 12)
+```
+
+## Five implications matter most for category selection
+
+- Breakfast becomes more coffee-centered as SES rises.
+- Lunch remains sandwich-heavy across strata, but salad lunches gain share in higher SES.
+- Lower-SES dinners are more tortilla-centered than highest-SES dinners.
+- Snacks are dominated by `other snack`, `sweet snack`, and `salty snack` in every income group.
+- `Other` buckets remain large enough that a second-pass taxonomy refinement would be valuable before mapping directly into NiQ categories.
+
+## Mapping archetypes to NielsenIQ supercategories: a constrained 20-category recommendation
+
+The disaggregated supercategory list for Food & Beverages (`Super Category - Food & Beverages (Disagg list).xlsx`) contains 54 supercategories. If we can request data from at most 20 of them, the selection below maximises the number of meal archetypes that can be identified -- or reasonably approximated -- from Homescan purchase data.
+
+This is a coverage-maximising request list under the disagg-list-only constraint, not a claim that Homescan can reconstruct every meal archetype one-for-one.
+
+One binding constraint shapes every choice that follows: **MEAT does not appear in the 54-item disagg list.** The `meat_poultry` food group is the defining ingredient in several high-prevalence dinner and lunch archetypes (protein + starch dinner, plate lunch, sandwich lunch/dinner). PREPARED FOODS, MEAL COMBOS, and SEAFOOD partially bridge the gap, but protein-centred archetypes will always have weaker coverage than they should.
+
+**Practical takeaway:** most remaining tradeoffs in the 20-category list are downstream of the missing MEAT supercategory, not of the NHANES archetype logic.
+
+### The 20 picks
+
+| # | NiQ Supercategory | NHANES Food Group(s) | Key Archetypes Served | Rationale |
+|:--|:--|:--|:--|:--|
+| 1 | CEREAL & GRANOLA | cereal_oatmeal | Cereal/oatmeal breakfast (21.6%) | Highly diagnostic -- cereal purchase almost certainly means cereal breakfast |
+| 2 | COFFEE | coffee_tea | Coffee-first breakfast (15.8%), coffee & pastry (9.8%), coffee/tea snack (3.0%) | Diagnostic of 3 archetypes totalling ~29% of breakfasts |
+| 3 | BREAD | bread | Eggs w/ bread breakfast (9.5%), sandwich lunch/dinner/snack, coffee & pastry | Core ingredient in the most common lunch archetype (sandwich, 28.3%) |
+| 4 | MILK PRODUCTS | milk_dairy_drink | Cereal breakfast (pairs w/ cereal) | Cereal + milk co-purchase is the strongest archetype signal in the data |
+| 5 | EGGS | eggs | Eggs w/ bread/meat breakfast (9.5%), breakfast sandwich (9.6%) | Diagnostic of morning protein archetypes |
+| 6 | SALTY SNACKS | salty_snack | Salty snack (22.0% of all snacks) | Near-perfect diagnostic match to a single high-prevalence archetype |
+| 7 | COOKIES & CRACKERS | sweet_baked (partial), salty_snack (crackers) | Sweet snack (35.8%), salty snack overlap | Bridges both sweet and salty snack archetypes |
+| 8 | DESSERTS/SWEET GOODS | sweet_baked (ice cream, cakes, pudding) | Sweet snack (35.8%) | Combined with COOKIES & CRACKERS, covers the single largest archetype by meal count |
+| 9 | PREPARED FOODS | soup, mixed_main (partial) | Soup lunch (4.6%), soup dinner (5.9%), mixed entree meals | Covers soup archetypes + partially bridges the meat gap (rotisserie chicken, frozen meals) |
+| 10 | MEAL COMBOS | mixed_main (partial) | Mixed entree dinner (16.4%), mixed entree lunch (10.5%) | Frozen meals, mac & cheese, skillet meals -- diagnostic of the 2nd-largest dinner archetype |
+| 11 | PASTA/RICE/GRAINS | grain_starch | Plate lunch (10.9%), protein + starch dinners (8.6-9.4%), mixed entree lunch | Core starch component across dinner and lunch archetypes |
+| 12 | VEGETABLES | vegetables | Protein + veg + starch dinner (9.4%), salad lunch (7.1%), plate lunch (10.9%) | Essential for identifying the most "complete" dinner and lunch archetypes |
+| 13 | FRUIT | fruit | Other snack (37.0% -- fruit is #1 food), yogurt & fruit breakfast, fruit & dairy snack | The "other snack" bucket is dominated by fruit + nuts; FRUIT helps decode it |
+| 14 | CHEESE | cheese | Salad lunch, sandwich meals, fruit & dairy snack | Appears across many archetypes as a diagnostic accompaniment |
+| 15 | BEVERAGES | sweet_drink, juice_smoothie | Cross-archetype accompaniment; OJ at breakfast, soda at dinner | High-frequency category; soda/juice co-purchase helps distinguish meal occasions |
+| 16 | PIZZA | pizza | Pizza dinner (6.5%), pizza lunch (5.0%) | Perfectly diagnostic -- pizza purchase = pizza meal |
+| 17 | WRAPS & TORTILLA SHELLS | tortilla | Tortilla dinner (7.7%), tortilla lunch (5.1%) | SES-sensitive: 10.1% of lower-SES dinners vs 5.3% of highest-SES |
+| 18 | CONDIMENTS | condiment_fat (ketchup, mayo, mustard) | Sandwich lunch/dinner, plate lunch, salad lunch | Accompaniment that helps reconstruct composed meals from ingredient baskets |
+| 19 | SEAFOOD | seafood | Protein + veg + starch dinner (9.4%) | The only direct protein source available without MEAT |
+| 20 | NUT BUTTERS/JAM/JELLIES | beans_nuts (partial) | Sandwich lunch/snack (PB&J), breakfast spreads | PB&J is the #1 sandwich type in lower-SES lunch data; highly diagnostic at the SKU level |
+
+### Archetype coverage scorecard
+
+**Breakfast**
+
+| Archetype | Prevalence | Coverage | Key NiQ Categories |
+|:--|:--|:--|:--|
+| Cereal/oatmeal | 21.6% | Strong | CEREAL & GRANOLA + MILK PRODUCTS |
+| Coffee-first | 15.8% | Strong | COFFEE |
+| Coffee & pastry | 9.8% | Strong | COFFEE + BREAD + COOKIES & CRACKERS |
+| Breakfast sandwich/burrito | 9.6% | Moderate | EGGS + BREAD + WRAPS & TORTILLA SHELLS (meat gap) |
+| Eggs w/ bread/meat | 9.5% | Moderate | EGGS + BREAD (breakfast meat gap) |
+| Fruit & bread | 2.0% | Strong | FRUIT + BREAD + NUT BUTTERS/JAM/JELLIES |
+| Yogurt & fruit | 1.1% | Partial | FRUIT (no YOGURT selected) |
+| Other breakfast | 30.7% | Partial | BEVERAGES + DESSERTS/SWEET GOODS |
+
+**Lunch**
+
+| Archetype | Prevalence | Coverage | Key NiQ Categories |
+|:--|:--|:--|:--|
+| Sandwich | 28.3% | Moderate | BREAD + CONDIMENTS + CHEESE + NUT BUTTERS (meat gap) |
+| Plate | 10.9% | Moderate | PASTA/RICE/GRAINS + VEGETABLES (meat gap) |
+| Mixed entree | 10.5% | Strong | MEAL COMBOS + PREPARED FOODS + PASTA/RICE/GRAINS |
+| Salad | 7.1% | Strong | VEGETABLES + CHEESE + CONDIMENTS |
+| Tortilla | 5.1% | Strong | WRAPS & TORTILLA SHELLS |
+| Pizza | 5.0% | Strong | PIZZA |
+| Soup | 4.6% | Strong | PREPARED FOODS |
+| Other lunch | 28.4% | Partial | BEVERAGES + PASTA/RICE/GRAINS |
+
+**Dinner**
+
+| Archetype | Prevalence | Coverage | Key NiQ Categories |
+|:--|:--|:--|:--|
+| Mixed entree | 16.4% | Strong | MEAL COMBOS + PREPARED FOODS |
+| Sandwich | 15.0% | Moderate | BREAD + CONDIMENTS (meat gap) |
+| Protein + veg + starch | 9.4% | Moderate | VEGETABLES + PASTA/RICE/GRAINS + SEAFOOD (meat gap) |
+| Protein + starch | 8.6% | Weak | PASTA/RICE/GRAINS (meat is the defining ingredient) |
+| Tortilla | 7.7% | Strong | WRAPS & TORTILLA SHELLS |
+| Pizza | 6.5% | Strong | PIZZA |
+| Soup | 5.9% | Strong | PREPARED FOODS |
+| Other dinner | 30.4% | Partial | PASTA/RICE/GRAINS + DESSERTS/SWEET GOODS |
+
+**Snack**
+
+| Archetype | Prevalence | Coverage | Key NiQ Categories |
+|:--|:--|:--|:--|
+| Sweet snack | 35.8% | Strong | COOKIES & CRACKERS + DESSERTS/SWEET GOODS |
+| Salty snack | 22.0% | Strong | SALTY SNACKS |
+| Coffee/tea snack | 3.0% | Strong | COFFEE |
+| Sandwich snack | 1.4% | Moderate | BREAD + NUT BUTTERS + CONDIMENTS |
+| Fruit & dairy | 0.9% | Moderate | FRUIT + CHEESE (yogurt gap) |
+| Other snack | 37.0% | Moderate | FRUIT + NUT BUTTERS (nuts & seeds are #1 item) |
+
+### Coverage summary
+
+- **Strong coverage** (most defining components mapped): 17 of 30 archetypes.
+- **Moderate coverage** (identifiable but with gaps, primarily due to missing MEAT): 9 of 30 archetypes.
+- **Weak or partial coverage** (protein + starch dinner, "other" buckets): 4 of 30 archetypes.
+- Six archetypes are degraded specifically by the meat gap: sandwich lunch/dinner, breakfast sandwich, plate lunch, protein + starch dinner, protein + veg + starch dinner.
+
+### What got cut and why
+
+| Excluded Supercategory | Why It Lost |
+|:--|:--|
+| YOGURT | Only 2 archetypes at less than 1.2% each; CHEESE covers the dairy-snack role partially |
+| SAUCE/GRAVY/MARINADE | Important for dinner but not diagnostic; PREPARED FOODS and MEAL COMBOS cover the meal-level signal |
+| SALAD DRESSING | Salad lunch already covered by VEGETABLES + CHEESE + CONDIMENTS |
+| OILS/BUTTER/MARGARINE SPREADS/SUBSTITUTES | Ubiquitous but non-diagnostic; butter/oil purchases do not signal specific meals |
+| CANDY/GUM/MINTS | Sweet snack already well-covered by COOKIES & CRACKERS + DESSERTS/SWEET GOODS |
+| NUTS & SEEDS | "Other snack" (nuts) partially captured by NUT BUTTERS; lower diagnostic value |
+| BAKING STAPLES / BAKING MIXES / BAKING SUPPLIES | Ingredient categories with no clear archetype match |
+| DOUGHNUTS / MUFFINS / TOASTER PASTRIES | Too niche; COOKIES & CRACKERS + BREAD cover the sweet-baked breakfast space |
+| ROLLS & BUNS | Redundant with BREAD for sandwich reconstruction |
+| SUGAR & SWEETENERS | Non-diagnostic accompaniment |
+| BEANS | Low archetype prevalence; partially captured in PREPARED FOODS |
+| MILK/DAIRY ALTERNATIVE | Growing but still low prevalence vs MILK PRODUCTS |
+| ALCOHOL | Not a meal-defining archetype component in this framework |
+
+### Possible next steps
+
+- **Formalize the NHANES-to-NiQ crosswalk.** Create a systematic mapping table from the 28 NHANES food groups to the 20 selected supercategories, documenting coverage and gaps.
+- **Build basket definitions.** For each archetype, define the expected NiQ supercategory co-purchase basket (e.g. cereal breakfast = CEREAL & GRANOLA + MILK PRODUCTS within the same trip).
+- **Estimate coverage quantitatively.** Using the meal-level archetype data (`meal_level_archetypes.csv`), compute what percentage of each archetype's food groups map to the 20 selected supercategories.
+- **Address the "other" buckets.** A second-pass taxonomy refinement could reclassify some "other" meals into identifiable patterns using the 20 supercategories.
+- **Draft the formal NielsenIQ data request** specifying the 20 supercategories.
+
+## Appendix: reusable outputs and data dictionary {.unnumbered}
+
+### Four public files are sufficient to reconstruct a first-pass meal dataset
+
+- `DEMO_L.XPT`: NHANES demographics, including `INDFMPIR` and age
+- `DR1IFF_L.XPT`: Day 1 individual foods file
+- `DRXFCD_L.XPT`: food code descriptions
+- `WWEIA_August2021_August2023_foodcat_FNDDS.xlsx`: USDA category mapping from food codes to WWEIA-style food categories
+
+### The analysis intentionally trades detail for interpretability
+
+- Unit of analysis: one respondent, one day, one eating occasion
+- Included occasions: breakfast, lunch, dinner, and snack
+- Weighting: `WTDRD1`
+- SES stratification:
+  - all respondents
+  - `PIR >= 3`
+  - `PIR >= 5`
+  - `PIR < 1.3`
+- Archetypes are assigned heuristically from food-category combinations and USDA combination codes
+
+These choices are deliberate. A simple, transparent taxonomy is easier to pressure-test and easier to map into a constrained supercategory purchase decision than a more complex black-box clustering approach.
+
+### Source file roles, descriptive statistics, and sample rows
+
+These four files are complementary: demographics provide the SES lens, the Day 1 foods file provides meal content, the food-description file makes the coded foods interpretable, and the USDA category mapping makes it possible to collapse detailed food codes into broader meal components.
+
+```{r source-role-summary, echo=FALSE}
+source_role_summary <- tibble::tribble(
+  ~file, ~observational_unit, ~rows, ~columns, ~key_fields_used, ~what_it_contributes,
+  "DEMO_L.XPT",
+  "respondent",
+  nrow(demo),
+  ncol(demo),
+  "SEQN, INDFMPIR, RIDAGEYR",
+  "Defines the respondent universe and supplies the SES and age variables used for stratification.",
+  "DR1IFF_L.XPT",
+  "food item within respondent-day recall",
+  nrow(raw_foods),
+  ncol(raw_foods),
+  "SEQN, DR1_020, DR1_030Z, DR1CCMTX, DR1IFDCD, DR1IKCAL, WTDRD1",
+  "Provides the meal content, eating occasion, calories, and dietary weights used to build meal events.",
+  "DRXFCD_L.XPT",
+  "food code",
+  nrow(drxfd),
+  ncol(drxfd),
+  "DRXFDCD, DRXFCLD",
+  "Adds human-readable food descriptions that make individual food codes interpretable alongside the broader category mapping.",
+  "WWEIA food-category mapping",
+  "food code",
+  nrow(foodcat),
+  ncol(foodcat),
+  "food_code, category_number, category_description",
+  "Maps detailed food codes into broader food groups that can be used to infer meal structure."
+)
+
+render_table(source_role_summary)
+```
+
+```{r source-statistics, echo=FALSE}
+source_statistics <- tibble::tribble(
+  ~dataset, ~statistic, ~value,
+  "Demographics", "Unique respondents", scales::comma(dplyr::n_distinct(demo$SEQN)),
+  "Demographics", "Age range", paste0(round(min(demo$RIDAGEYR, na.rm = TRUE), 1), " to ", round(max(demo$RIDAGEYR, na.rm = TRUE), 1)),
+  "Demographics", "Median age", as.character(round(stats::median(demo$RIDAGEYR, na.rm = TRUE), 1)),
+  "Demographics", "Median income-to-poverty ratio", as.character(round(stats::median(demo$INDFMPIR, na.rm = TRUE), 2)),
+  "Demographics", "Missing income-to-poverty ratio", scales::percent(mean(is.na(demo$INDFMPIR)), accuracy = 0.1),
+  "Day 1 foods", "Unique respondents", scales::comma(dplyr::n_distinct(raw_foods$SEQN)),
+  "Day 1 foods", "Unique food codes", scales::comma(dplyr::n_distinct(raw_foods$food_code)),
+  "Day 1 foods", "Median calories per food row", as.character(round(stats::median(raw_foods$DR1IKCAL, na.rm = TRUE), 1)),
+  "Day 1 foods", "Mean calories per food row", as.character(round(mean(raw_foods$DR1IKCAL, na.rm = TRUE), 1)),
+  "Food descriptions", "Distinct food codes", scales::comma(dplyr::n_distinct(drxfd$food_code)),
+  "Food descriptions", "Rows with non-missing descriptions", scales::percent(mean(!is.na(drxfd$food_description)), accuracy = 0.1),
+  "Category mapping", "Distinct mapped food codes", scales::comma(dplyr::n_distinct(foodcat$food_code)),
+  "Category mapping", "Distinct category numbers", scales::comma(dplyr::n_distinct(foodcat$category_number)),
+  "Category mapping", "Distinct category descriptions", scales::comma(dplyr::n_distinct(foodcat$category_description))
+)
+
+render_table(source_statistics)
+```
+
+Taken together, these summaries show that the source files operate at three different levels: respondent, food item, and codebook. The demographics file defines who is in the sample, the Day 1 foods file captures what each person reported consuming, and the two code-level files make it possible to translate highly granular food codes into interpretable food groups.
+
+The practical conclusion is that the analysis derives meal structure by linking a large respondent file to a large food-level file and then using USDA coding infrastructure to convert reported foods into broader meal components.
+
+```{r source-sample-rows, echo=FALSE, results='asis'}
+demo_sample <- demo %>%
+  select(SEQN, RIDAGEYR, INDFMPIR) %>%
+  slice_head(n = 2)
+
+foods_sample <- raw_foods %>%
+  select(SEQN, DR1_020, occasion, food_code, category_description, DR1IKCAL, WTDRD1) %>%
+  slice_head(n = 2)
+
+drxfd_sample <- drxfd %>%
+  select(food_code, food_description) %>%
+  slice_head(n = 2)
+
+foodcat_sample <- foodcat %>%
+  select(food_code, category_number, category_description) %>%
+  slice_head(n = 2)
+
+print(render_table(demo_sample, caption = "Sample rows from DEMO_L.XPT"))
+print(render_table(foods_sample, caption = "Sample rows from DR1IFF_L.XPT after preparation"))
+print(render_table(drxfd_sample, caption = "Sample rows from DRXFCD_L.XPT"))
+print(render_table(foodcat_sample, caption = "Sample rows from the USDA food-category mapping"))
+```
+
+These examples make the linkage logic tangible. The demographics file is respondent-level and sparse, the foods file is long and event-level, and the two code tables are lookup layers. The meal analysis works by joining those tables on respondent identifier and food code, then rolling the enriched food rows up into meal events.
+
+
+### Derivation pipeline, diagnostics, and derived sample rows
+
+```{r derivation-summary, echo=FALSE}
+derivation_summary <- tibble::tribble(
+  ~step, ~unit_after_step, ~rows_or_count, ~what_is_happening,
+  "Start with Day 1 food records", "food row", scales::comma(nrow(raw_foods)), "Each row is one reported item consumed by one respondent on one recall day.",
+  "Group food rows into meal events", "meal", scales::comma(nrow(meals)), "Food rows are collapsed by respondent, reported time, and eating occasion.",
+  "Carry respondent attributes into meals", "meal", scales::comma(dplyr::n_distinct(meals$SEQN)), "Each meal inherits respondent-level SES and age from the demographics file.",
+  "Assign broad meal archetypes", "meal", scales::comma(dplyr::n_distinct(meals$archetype)), "Meals are labeled using food-group presence plus USDA combination codes.",
+  "Summarize by SES and occasion", "occasion x archetype x SES", scales::comma(nrow(summary_table)), "Meal counts are weighted and compared within occasion and income strata."
+)
+
+render_table(derivation_summary)
+```
+
+```{r derivation-diagnostics, echo=FALSE, results='asis'}
+occasion_code_summary <- raw_foods %>%
+  count(occasion, wt = WTDRD1, name = "weighted_food_rows") %>%
+  mutate(weighted_share = weighted_food_rows / sum(weighted_food_rows)) %>%
+  arrange(desc(weighted_food_rows)) %>%
+  mutate(weighted_share = scales::percent(weighted_share, accuracy = 0.1))
+
+archetype_diagnostics <- tibble::tribble(
+  ~metric, ~value,
+  "Distinct meal archetypes assigned", scales::comma(dplyr::n_distinct(meals$archetype)),
+  "Breakfast meals in 'other' archetype", scales::percent(summary_table %>% filter(stratum == "all", occasion == "breakfast", archetype == "other breakfast") %>% pull(weighted_share), accuracy = 0.1),
+  "Lunch meals in 'other' archetype", scales::percent(summary_table %>% filter(stratum == "all", occasion == "lunch", archetype == "other lunch") %>% pull(weighted_share), accuracy = 0.1),
+  "Dinner meals in 'other' archetype", scales::percent(summary_table %>% filter(stratum == "all", occasion == "dinner", archetype == "other dinner") %>% pull(weighted_share), accuracy = 0.1),
+  "Snack meals in 'other' archetype", scales::percent(summary_table %>% filter(stratum == "all", occasion == "snack", archetype == "other snack") %>% pull(weighted_share), accuracy = 0.1)
+)
+
+print(render_table(occasion_code_summary))
+print(render_table(archetype_diagnostics))
+```
+
+The breakdown above clarifies what is observed versus what is derived. The observed inputs are respondents, reported foods, food descriptions, and USDA food categories. The derived outputs are meal events and meal archetypes. In practice, the analysis constructs labels such as "sandwich lunch" and "tortilla dinner" from the combination of foods reported within an eating occasion.
+
+The main implication is that this is a transparent rules-based classification layer on top of a very detailed intake dataset. That makes the results easy to audit and revise. The `other` categories remain large because the code prioritizes stable, interpretable classifications and routes ambiguous meals into a residual bucket.
+
+```{r derived-sample-rows, echo=FALSE, results='asis'}
+meal_sample <- meals %>%
+  select(meal_key, SEQN, occasion, total_kcal, pir, top_groups, top_categories, archetype) %>%
+  slice_head(n = 2)
+
+summary_sample <- summary_table %>%
+  select(stratum, occasion, archetype, weighted_meals, participants, weighted_share) %>%
+  slice_head(n = 2) %>%
+  mutate(weighted_share = scales::percent(weighted_share, accuracy = 0.1))
+
+print(render_table(meal_sample, caption = "Sample rows from the derived meal-level dataset"))
+print(render_table(summary_sample, caption = "Sample rows from the derived SES-by-occasion summary table", digits = 1))
+```
+
+These derived rows show the analytical progression clearly. The meal-level file is the core working dataset: it converts many individual food rows into a single interpretable eating occasion. The summary table is one step further removed; it aggregates those meal rows by SES, occasion, and archetype so that the report can make directional statements such as "high-income breakfasts are more coffee-led" or "lower-income dinners are more tortilla-centered."
+
+
+### Data inventory and meal construction summary
+
+### The source files are large and internally complementary
+
+This table is a quick audit of the four source files used in the analysis. It helps confirm the document is pulling from the expected NHANES/WWEIA inputs and gives a rough sense of the scale of each file before any meal construction happens.
+
+```{r data-inventory, echo=FALSE}
+data_inventory <- tibble::tibble(
+  dataset = c(
+    "NHANES demographics",
+    "WWEIA Day 1 individual foods",
+    "Food code descriptions",
+    "Food-code to category mapping"
+  ),
+  rows = c(nrow(demo), nrow(raw_foods), nrow(drxfd), nrow(foodcat)),
+  columns = c(ncol(demo), ncol(raw_foods), ncol(drxfd), ncol(foodcat))
+)
+
+render_table(data_inventory, digits = 0)
+```
+
+### Collapsing foods into meal events yields a tractable analytical file
+
+This section summarizes what happens after the individual food records are collapsed into meal events. It shows how many Day 1 food rows survive the occasion filter, how many meal-level records are created, how many unique respondents those meals represent, and the basic calorie distribution of the resulting meal file.
+
+```{r meal-summary, echo=FALSE}
+meal_summary <- tibble::tibble(
+  metric = c(
+    "Day 1 food rows retained after occasion filtering",
+    "Constructed meal rows",
+    "Unique respondents represented in meals",
+    "Mean calories per meal",
+    "Median calories per meal"
+  ),
+  value = c(
+    nrow(raw_foods),
+    nrow(meals),
+    dplyr::n_distinct(meals$SEQN),
+    round(mean(meals$total_kcal, na.rm = TRUE), 1),
+    round(stats::median(meals$total_kcal, na.rm = TRUE), 1)
+  )
+)
+
+render_table(meal_summary)
+```
+
+### Occasion distribution table
+
+```{r occasion-table-appendix, echo=FALSE}
+occasion_distribution <- meals %>%
+  group_by(occasion) %>%
+  summarise(
+    unweighted_meals = dplyr::n(),
+    weighted_meals = sum(weight, na.rm = TRUE),
+    avg_kcal = mean(total_kcal, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(weighted_share = weighted_meals / sum(weighted_meals))
+
+render_table(
+  occasion_distribution %>%
+    mutate(weighted_share = scales::percent(weighted_share, accuracy = 0.1)),
+  digits = 1
+)
+```
+
+### The report is set up to function as a reusable production asset
+
+This document rebuilds the same core tabular outputs used elsewhere in the project. That makes it useful both as a communication artifact and as a repeatable analytical asset that can be refreshed when the taxonomy changes.
+
+- `analysis/nhanes/participant_strata.csv`
+- `analysis/nhanes/top_archetypes.csv`
+- `analysis/nhanes/meal_level_archetypes.csv`
+
+If you want to refresh those files from R instead of Python, you can run the final chunk below.
+
+```{r write-outputs, eval=FALSE}
+participants %>% write.csv(file.path(out_dir, "participant_strata.csv"), row.names = FALSE)
+summary_table %>% write.csv(file.path(out_dir, "top_archetypes.csv"), row.names = FALSE)
+
+meals %>%
+  select(meal_key, SEQN, occasion, archetype, pir, age, weight, total_kcal, top_groups, top_categories) %>%
+  write.csv(file.path(out_dir, "meal_level_archetypes.csv"), row.names = FALSE)
+```
+
